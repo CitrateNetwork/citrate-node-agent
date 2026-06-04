@@ -1,0 +1,11 @@
+[package]
+name = "config"
+version = "0.1.0"
+description = "compute.json reader for the Citrate node agent (the set-and-forget settings file gui-native persists)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

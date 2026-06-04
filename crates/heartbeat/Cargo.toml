@@ -1,0 +1,16 @@
+[package]
+name = "heartbeat"
+version = "0.1.0"
+description = "HeartbeatMonitor.heartbeat() calldata + 30s liveness loop for the Citrate node agent (anti-suspension/anti-slash)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chainio = { path = "../chainio" }
+tokio.workspace = true
+
+[dev-dependencies]
+# `test-util` gives us `#[tokio::test(start_paused = true)]` so the 30s cadence
+# loop runs instantly (virtual time) in unit tests.
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

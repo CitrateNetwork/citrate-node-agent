@@ -22,11 +22,26 @@ re-mirror the book and update the test in the same change.
 
 ## Build & test
 
-Pure-`std`, no external dependencies (S0/S1).
-
 ```bash
 cargo build
 cargo test
+```
+
+The pure-logic crates (`config`, `bidder`, and the `chainio` ABI/selectors)
+build and test fully offline. The `chainio` JSON-RPC read client adds a minimal
+well-known stack (`reqwest` + `tokio` + `serde_json` + `tiny-keccak`); its unit
+tests still run offline, and the live-RPC integration tests
+(`crates/chainio/tests/live_rpc.rs`) skip cleanly unless `CITRATE_RPC_URL`
+points at a chain-40204 endpoint:
+
+```bash
+CITRATE_RPC_URL=<chain-40204 rpc> cargo test -p chainio -- --nocapture
+```
+
+Run the agent (offline config self-check, or live reads with `CITRATE_RPC_URL`):
+
+```bash
+node-agent path/to/compute.json [job-id]
 ```
 
 ## Crate layout (roadmap)
@@ -34,22 +49,31 @@ cargo test
 This repo ships only what is real and compiles — no empty stub crates
 (federation Rule 1). New crates land as their SELL stage is implemented.
 
-- **chainio** — *shipped (S0).* Canonical chain-40204 address book +
-  (future) marketplace / pool / oracle / heartbeat clients and ABIs.
-- **bidder** — *S1.* Cost-plus strategy over `ComputePricingOracle` + score
-  model, with caps and tier filtering.
-- **lifecycle** — *S1/S2.* The on-chain job state machine:
-  `startExecution → submitCommitment → submitResult → completeJob`.
+- **chainio** — *shipped (S0/S1).* Canonical chain-40204 address book +
+  EVM JSON-RPC read client (`eth_call`/`eth_getCode`/`eth_chainId`), a minimal
+  ABI codec, pinned function selectors, and typed `getProvider` / `getJob` /
+  `saltPerPflopHour` decode + write-calldata builders.
+- **config** — *shipped (S1).* `compute.json` reader
+  (`{ enabled, allocation_percent, schedule }`) + schedule-window logic.
+- **bidder** — *shipped (S1).* Pure cost-plus `evaluate(job, oracle, settings,
+  caps) -> BidDecision`: `enabled`/schedule/Commitment-cap (`< 10 SALT`)/
+  capacity (`< 80%`)/deadline gating, then `cost × 1.15` capped at 90% of
+  `maxPrice`. Unit-tests every SELL-S1 scenario.
+- **heartbeat** — *shipped (S1).* `HeartbeatMonitor.heartbeat()` calldata + a
+  30s liveness loop behind a `HeartbeatSender` trait (anti-slash).
+- **node-agent** — *shipped (S1).* Binary tying `compute.json` → clock → live
+  chain reads → the bidder decision.
+- **lifecycle** — *S2.* The on-chain job state machine:
+  `startExecution → submitCommitment → submitResult → completeJob`
+  (calldata builders already in `chainio::marketplace`).
 - **executor** — *S2.* Model provisioning (ModelRegistry CID → IPFS fetch →
   SHA3 verify → cache), inference runtime adapter (`trait Inference`), and
   Commitment proof (`trait ProofMaker`; ZK/TEE behind a feature flag in S5).
-- **heartbeat** — *S1.* `HeartbeatMonitor.heartbeat()` loop and suspension
-  watch (anti-slash).
-- **schedule** — *S3.* Window gate + allocation enforcement
+- **schedule** — *S3.* Allocation enforcement
   (Linux cgroup v2 + `nvidia-smi`; macOS/Windows advisory).
 - **earnings** — *S2.* Claimable poll + auto `claimRewards` over
   `ContributionAccounting`.
-- **supervision** — *S1.* Local HTTP control surface
+- **supervision** — *S1+.* Local HTTP control surface
   (`/health` `/status` `/pause` `/resume`) the GUI drives.
 
 ## Build order (maps to SELL-Sn)
