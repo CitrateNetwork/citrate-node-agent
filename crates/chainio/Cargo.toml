@@ -1,0 +1,11 @@
+[package]
+name = "chainio"
+version = "0.1.0"
+description = "Canonical chain-40204 address book + contract clients for the Citrate node agent."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No external dependencies — pure std. The address book is the only thing that
+# ships in S0/S1; keep the dependency surface empty until a real client lands.
+[dependencies]
