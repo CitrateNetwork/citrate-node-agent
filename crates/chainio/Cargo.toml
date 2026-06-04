@@ -1,11 +1,19 @@
 [package]
 name = "chainio"
 version = "0.1.0"
-description = "Canonical chain-40204 address book + contract clients for the Citrate node agent."
+description = "Canonical chain-40204 address book + EVM JSON-RPC read client / ABI codec for the Citrate node agent."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# No external dependencies — pure std. The address book is the only thing that
-# ships in S0/S1; keep the dependency surface empty until a real client lands.
+# The address book (`addrbook`) is pure-std. The JSON-RPC read client
+# (`rpc`/`abi`) adds the minimal well-known stack: reqwest+tokio for eth_call,
+# serde_json for the JSON-RPC envelope, tiny-keccak for function selectors.
+# Unit tests (selectors, ABI codec) run fully offline; only the live-RPC
+# integration tests need CITRATE_RPC_URL.
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tiny-keccak.workspace = true

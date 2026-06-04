@@ -1,0 +1,13 @@
+[package]
+name = "bidder"
+version = "0.1.0"
+description = "Cost-plus auto-bidding strategy for the Citrate node agent: tier caps, schedule + capacity + deadline gating, and bid pricing."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure logic. Depends only on `config` for the schedule window types. No I/O,
+# no async, no external crates — so every SELL-S1 bidding scenario is a fast
+# offline unit test.
+[dependencies]
+config = { path = "../config" }
