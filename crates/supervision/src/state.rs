@@ -1,0 +1,347 @@
+//! `state` — the supervised agent's observable state machine.
+//!
+//! [`AgentState`] is the single shared record the daemon loop writes and the
+//! supervision HTTP endpoints read. It is deliberately free of chain/ABI/key
+//! concerns: the loop feeds it primitives (heartbeat timestamps, active-job
+//! counts, reputation, the last bid decision) and the endpoints serialize a
+//! [`Health`] snapshot from it.
+//!
+//! The state machine is small and total:
+//!   - `Idle`      — running, no job in flight, not currently mid-evaluation.
+//!   - `Bidding`   — evaluating / has just decided to bid on a job.
+//!   - `Executing` — at least one job is in flight (S2 work; the count is
+//!     surfaced now so the GUI and pause semantics are real today).
+//!   - `Paused`    — the operator paused new bidding via `/pause`.
+//!
+//! Pause semantics (SELL-S1 acceptance): `/pause` sets `Paused` and makes
+//! [`AgentState::accepts_new_bids`] return `false`, so the daemon loop skips
+//! evaluating *new* jobs — but in-flight jobs keep their `active_jobs` count and
+//! are allowed to finish (nothing here cancels them). `/resume` clears the pause
+//! and the loop's next tick recomputes a running state from the live counts.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+/// The coarse lifecycle state the GUI observes via `/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LifecycleState {
+    /// Running, idle — no in-flight job, not mid-evaluation.
+    Idle,
+    /// Actively evaluating / decided to bid this tick.
+    Bidding,
+    /// One or more jobs are in flight.
+    Executing,
+    /// Operator paused new bidding (in-flight jobs still finish).
+    Paused,
+}
+
+impl LifecycleState {
+    /// The exact `/status` string for this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LifecycleState::Idle => "idle",
+            LifecycleState::Bidding => "bidding",
+            LifecycleState::Executing => "executing",
+            LifecycleState::Paused => "paused",
+        }
+    }
+}
+
+/// The JSON body served by `GET /health`.
+///
+/// `heartbeat_age_secs` is `None` until the first heartbeat is recorded (so the
+/// GUI can tell "never beat" from "beat 0s ago"); everything else is always
+/// present so the GUI's health gauge is total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Health {
+    /// Coarse lifecycle state (mirrors `/status`).
+    pub state: LifecycleState,
+    /// Seconds since the last heartbeat was sent, or `None` if none yet.
+    pub heartbeat_age_secs: Option<u64>,
+    /// Number of jobs currently in flight.
+    pub active_jobs: u32,
+    /// Configured concurrency ceiling (`maxConcurrentJobs`).
+    pub max_concurrent: u32,
+    /// Provider reputation in basis points (0..=10000), from the last chain read.
+    pub reputation_bps: u32,
+    /// Last error the loop recorded (heartbeat send failure, RPC blip, …), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Monotonic-ish wall clock used for heartbeat-age math. Pulled out behind a
+/// function so tests can drive it deterministically.
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The shared, mutable agent state. Wrapped in `Arc<RwLock<…>>` by the daemon so
+/// the loop and the HTTP handlers share one record.
+///
+/// `Default` yields a fresh, running, un-paused agent (all counters zero, no
+/// heartbeat yet) — see the field defaults below.
+#[derive(Debug, Clone, Default)]
+pub struct AgentState {
+    /// Operator pause flag. When set, no new bids are evaluated.
+    paused: bool,
+    /// Whether the current tick is mid-evaluation / decided to bid.
+    bidding: bool,
+    /// Jobs currently in flight (S2 fills this; S1 keeps it at 0 unless a test
+    /// or future executor increments it).
+    active_jobs: u32,
+    /// Concurrency ceiling from the provider profile.
+    max_concurrent: u32,
+    /// Reputation in basis points from the last chain read.
+    reputation_bps: u32,
+    /// UNIX seconds of the last heartbeat, or `None` if none sent yet.
+    last_heartbeat_unix: Option<u64>,
+    /// Last recorded error string, if any.
+    last_error: Option<String>,
+}
+
+impl AgentState {
+    /// A fresh, running, un-paused state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // ---- pause / resume (the supervision control surface) ----
+
+    /// Pause new bidding. In-flight jobs keep running; only *new* bids stop.
+    /// Idempotent.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        // Stop advertising "bidding" the instant we pause.
+        self.bidding = false;
+    }
+
+    /// Resume bidding after a pause. Idempotent.
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    /// Is the agent currently paused?
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Whether the daemon loop should evaluate *new* jobs this tick. False while
+    /// paused — the core of the pause semantics.
+    pub fn accepts_new_bids(&self) -> bool {
+        !self.paused
+    }
+
+    // ---- loop-fed inputs ----
+
+    /// Mark that the loop is evaluating / has decided to bid this tick. A no-op
+    /// while paused (paused never reports `bidding`).
+    pub fn set_bidding(&mut self, bidding: bool) {
+        if self.paused {
+            self.bidding = false;
+        } else {
+            self.bidding = bidding;
+        }
+    }
+
+    /// Record that the loop is idle this tick (cleared the bidding flag).
+    pub fn set_idle(&mut self) {
+        self.bidding = false;
+    }
+
+    /// Set the in-flight job count (executor-driven; S2). Provided now so the
+    /// `executing` state and `/health.active_jobs` are real.
+    pub fn set_active_jobs(&mut self, active: u32) {
+        self.active_jobs = active;
+    }
+
+    /// Update capacity + reputation from a fresh provider read.
+    pub fn set_provider_stats(&mut self, max_concurrent: u32, reputation_bps: u32) {
+        self.max_concurrent = max_concurrent;
+        self.reputation_bps = reputation_bps;
+    }
+
+    /// Record a heartbeat sent now (uses the wall clock).
+    pub fn record_heartbeat(&mut self) {
+        self.last_heartbeat_unix = Some(now_unix_secs());
+    }
+
+    /// Record a heartbeat sent at an explicit UNIX time (for deterministic tests).
+    pub fn record_heartbeat_at(&mut self, unix_secs: u64) {
+        self.last_heartbeat_unix = Some(unix_secs);
+    }
+
+    /// Record (or clear, with `None`) the last error string.
+    pub fn set_last_error(&mut self, err: Option<String>) {
+        self.last_error = err;
+    }
+
+    // ---- derived views (read by the HTTP handlers) ----
+
+    /// The coarse lifecycle state. Precedence: paused > executing > bidding > idle.
+    pub fn lifecycle(&self) -> LifecycleState {
+        if self.paused {
+            LifecycleState::Paused
+        } else if self.active_jobs > 0 {
+            LifecycleState::Executing
+        } else if self.bidding {
+            LifecycleState::Bidding
+        } else {
+            LifecycleState::Idle
+        }
+    }
+
+    /// Heartbeat age in seconds relative to `now_unix`, saturating at 0 if the
+    /// recorded beat is somehow in the future (clock skew).
+    pub fn heartbeat_age_secs_at(&self, now_unix: u64) -> Option<u64> {
+        self.last_heartbeat_unix
+            .map(|t| now_unix.saturating_sub(t))
+    }
+
+    /// Build the `/health` snapshot using the current wall clock.
+    pub fn health(&self) -> Health {
+        self.health_at(now_unix_secs())
+    }
+
+    /// Build the `/health` snapshot relative to an explicit `now_unix` (tests).
+    pub fn health_at(&self, now_unix: u64) -> Health {
+        Health {
+            state: self.lifecycle(),
+            heartbeat_age_secs: self.heartbeat_age_secs_at(now_unix),
+            active_jobs: self.active_jobs,
+            max_concurrent: self.max_concurrent,
+            reputation_bps: self.reputation_bps,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_state_is_idle_and_accepts_bids() {
+        let s = AgentState::new();
+        assert_eq!(s.lifecycle(), LifecycleState::Idle);
+        assert_eq!(s.lifecycle().as_str(), "idle");
+        assert!(s.accepts_new_bids());
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn bidding_flag_moves_idle_to_bidding() {
+        let mut s = AgentState::new();
+        s.set_bidding(true);
+        assert_eq!(s.lifecycle(), LifecycleState::Bidding);
+        s.set_idle();
+        assert_eq!(s.lifecycle(), LifecycleState::Idle);
+    }
+
+    #[test]
+    fn active_jobs_make_it_executing_over_bidding() {
+        let mut s = AgentState::new();
+        s.set_bidding(true);
+        s.set_active_jobs(1);
+        // Executing takes precedence over bidding.
+        assert_eq!(s.lifecycle(), LifecycleState::Executing);
+        assert_eq!(s.lifecycle().as_str(), "executing");
+    }
+
+    #[test]
+    fn pause_blocks_new_bids_but_not_inflight() {
+        let mut s = AgentState::new();
+        s.set_active_jobs(2); // two jobs in flight
+        s.pause();
+        assert!(s.is_paused());
+        assert!(!s.accepts_new_bids());
+        // Paused state is reported even with jobs in flight...
+        assert_eq!(s.lifecycle(), LifecycleState::Paused);
+        // ...but the in-flight count is untouched (jobs keep running).
+        assert_eq!(s.health_at(0).active_jobs, 2);
+    }
+
+    #[test]
+    fn paused_never_reports_bidding() {
+        let mut s = AgentState::new();
+        s.pause();
+        // The loop tries to mark bidding while paused — it must be ignored.
+        s.set_bidding(true);
+        assert_eq!(s.lifecycle(), LifecycleState::Paused);
+    }
+
+    #[test]
+    fn resume_restores_bid_acceptance() {
+        let mut s = AgentState::new();
+        s.pause();
+        assert!(!s.accepts_new_bids());
+        s.resume();
+        assert!(s.accepts_new_bids());
+        assert_eq!(s.lifecycle(), LifecycleState::Idle);
+    }
+
+    #[test]
+    fn pause_and_resume_are_idempotent() {
+        let mut s = AgentState::new();
+        s.pause();
+        s.pause();
+        assert!(s.is_paused());
+        s.resume();
+        s.resume();
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn heartbeat_age_is_none_until_first_beat_then_counts_up() {
+        let mut s = AgentState::new();
+        assert_eq!(s.health_at(1000).heartbeat_age_secs, None);
+        s.record_heartbeat_at(1000);
+        assert_eq!(s.heartbeat_age_secs_at(1000), Some(0));
+        assert_eq!(s.heartbeat_age_secs_at(1030), Some(30));
+    }
+
+    #[test]
+    fn heartbeat_age_saturates_on_future_clock_skew() {
+        let mut s = AgentState::new();
+        s.record_heartbeat_at(2000);
+        // "now" earlier than the recorded beat → saturate to 0, not underflow.
+        assert_eq!(s.heartbeat_age_secs_at(1900), Some(0));
+    }
+
+    #[test]
+    fn health_snapshot_carries_provider_stats_and_error() {
+        let mut s = AgentState::new();
+        s.set_provider_stats(10, 9230);
+        s.set_active_jobs(3);
+        s.set_last_error(Some("rpc blip".into()));
+        s.record_heartbeat_at(500);
+        let h = s.health_at(530);
+        assert_eq!(h.max_concurrent, 10);
+        assert_eq!(h.reputation_bps, 9230);
+        assert_eq!(h.active_jobs, 3);
+        assert_eq!(h.heartbeat_age_secs, Some(30));
+        assert_eq!(h.last_error.as_deref(), Some("rpc blip"));
+        assert_eq!(h.state, LifecycleState::Executing);
+    }
+
+    #[test]
+    fn health_omits_last_error_when_none() {
+        let s = AgentState::new();
+        let json = serde_json::to_string(&s.health_at(0)).unwrap();
+        assert!(!json.contains("last_error"), "json was: {json}");
+        // status string is present and lowercase.
+        assert!(json.contains("\"state\":\"idle\""), "json was: {json}");
+    }
+
+    #[test]
+    fn health_includes_last_error_when_set() {
+        let mut s = AgentState::new();
+        s.set_last_error(Some("boom".into()));
+        let json = serde_json::to_string(&s.health_at(0)).unwrap();
+        assert!(json.contains("\"last_error\":\"boom\""), "json was: {json}");
+    }
+}

@@ -15,4 +15,9 @@ chainio = { path = "../chainio" }
 config = { path = "../config" }
 bidder = { path = "../bidder" }
 heartbeat = { path = "../heartbeat" }
+supervision = { path = "../supervision" }
 tokio.workspace = true
+
+[dev-dependencies]
+# Virtual-time test clock for the daemon loop cadence tests.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
