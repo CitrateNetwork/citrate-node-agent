@@ -1,0 +1,19 @@
+[package]
+name = "supervision"
+version = "0.1.0"
+description = "Local HTTP supervision surface (/health /status /pause /resume) + the agent state machine the GUI drives (SELL-S1)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
+
+[dev-dependencies]
+# A tiny HTTP client to exercise the live server over an ephemeral TCP port in
+# integration tests (no chain, no keys). reqwest is already vendored offline.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
