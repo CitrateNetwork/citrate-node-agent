@@ -8,6 +8,8 @@
 //! (keys live in gui-native's keystore, broadcast lands in SELL-S2). It returns
 //! an explicit error rather than faking a successful broadcast.
 
+use std::path::PathBuf;
+
 use bidder::{Caps, ComputePricingOracle};
 use chainio::abi::{self, Address};
 use chainio::rpc::RpcClient;
@@ -15,6 +17,7 @@ use heartbeat::{HeartbeatError, HeartbeatSender};
 
 use crate::bridge;
 use crate::daemon::{MarketSnapshot, MarketView};
+use crate::execution::{InputSource, JobView, ResolvedJob};
 
 /// Real chain reads for one provider + one target job id.
 pub struct LiveMarketView {
@@ -76,6 +79,73 @@ impl MarketView for LiveMarketView {
             oracle,
         })
     }
+}
+
+/// Real `JobView`: resolves a job id via `getJob` + `getModel` + `eth_blockNumber`.
+///
+/// `expected_size` is `None` — `ModelRegistry.getModel` does not return
+/// `sizeBytes` (TD-26), so provisioning falls back to CID-addressed-transport
+/// integrity; supply a size only if a richer read is wired later.
+pub struct LiveJobView {
+    pub client: RpcClient,
+    pub marketplace: Address,
+    pub model_registry: Address,
+}
+
+impl JobView for LiveJobView {
+    async fn resolve(&self, job_id: u128) -> Result<ResolvedJob, String> {
+        let job = chainio::marketplace::live::get_job(&self.client, self.marketplace, job_id)
+            .await
+            .map_err(|e| format!("getJob: {e}"))?;
+        let model =
+            chainio::model_registry::live::get_model(&self.client, self.model_registry, job.model_hash)
+                .await
+                .map_err(|e| format!("getModel: {e}"))?;
+        let current_block = self
+            .client
+            .eth_block_number()
+            .await
+            .map_err(|e| format!("blockNumber: {e}"))?;
+        Ok(ResolvedJob {
+            job,
+            ipfs_cid: model.ipfs_cid,
+            is_active: model.is_active,
+            expected_size: None,
+            current_block,
+        })
+    }
+}
+
+/// Off-chain input channel as a watched directory: the requester / gateway drops
+/// the job input at `<dir>/<job_id>.bin`. `Job.inputHash` is only a hash, so this
+/// is the real delivery seam (a richer transport — gateway push, libp2p — can
+/// replace it behind the same `InputSource` trait). Returns `None` until the file
+/// appears (the executor holds and retries).
+pub struct FileInputSource {
+    pub dir: PathBuf,
+}
+
+impl InputSource for FileInputSource {
+    async fn input_for(&self, job_id: u128) -> Result<Option<Vec<u8>>, String> {
+        let path = self.dir.join(format!("{job_id}.bin"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        }
+    }
+}
+
+/// A 32-byte unpredictable commitment nonce from the OS RNG (`/dev/urandom`).
+/// The Commitment scheme needs the nonce to be unpredictable before the output
+/// is revealed.
+pub fn random_nonce() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
+    let mut buf = [0u8; 32];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    Ok(buf)
 }
 
 /// The honest heartbeat sender for the unsigned read-only agent.

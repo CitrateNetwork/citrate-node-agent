@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 
 use chainio::abi::Address;
-use chainio::marketplace::Job;
+use chainio::marketplace::{Job, JobState};
 use executor::{provision, CommitmentProver, Inference, ProofMaker, WeightSource};
 use lifecycle::{
     plan, AbortReason, CommitmentArtifacts, JobSigner, LifecycleAction, PlanInput, WriteIntent,
@@ -79,8 +79,12 @@ pub enum StepOutcome {
     RanInference,
     /// Job reached terminal success.
     Done,
-    /// Not our turn (Posted/Bidding).
+    /// Not our turn (Posted/Bidding, or the job isn't assigned to us).
     Idle,
+    /// The job is ours + Executing but the off-chain input has not arrived yet
+    /// (`Job.inputHash` is only a hash; the requester delivers the data
+    /// off-chain). Hold and retry next tick.
+    AwaitingInput,
     /// Job can't proceed (deadline/failed/expired/disputed/not-ours).
     Aborted(AbortReason),
     /// Provisioning / inference / signing errored this step (recorded, retryable).
@@ -178,6 +182,158 @@ async fn record_error(state: &SharedState, msg: String) -> StepOutcome {
     StepOutcome::Error(msg)
 }
 
+// ── live-loop integration ───────────────────────────────────────────────────
+
+/// A job resolved from chain reads (everything the executor needs except the
+/// off-chain input): the decoded job, its model location/activeness, an optional
+/// size for the integrity cross-check, and the current chain head.
+#[derive(Debug, Clone)]
+pub struct ResolvedJob {
+    pub job: Job,
+    pub ipfs_cid: String,
+    pub is_active: bool,
+    pub expected_size: Option<u64>,
+    pub current_block: u128,
+}
+
+/// Reads a job's on-chain state + model location. The live impl does
+/// `getJob` + `getModel` + `eth_blockNumber`; tests fake it.
+pub trait JobView {
+    fn resolve(
+        &self,
+        job_id: u128,
+    ) -> impl std::future::Future<Output = Result<ResolvedJob, String>> + Send;
+}
+
+/// Supplies a job's **off-chain** input. `Job.inputHash` is only a hash — the
+/// actual input bytes are delivered to the assigned provider off-chain (by the
+/// requester / gateway), so this is a distinct channel. Returns `None` when the
+/// input hasn't arrived yet (the executor holds and retries).
+pub trait InputSource {
+    fn input_for(
+        &self,
+        job_id: u128,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send;
+}
+
+/// Drives ONE configured job through its lifecycle, one step per [`tick`], by
+/// composing a [`JobView`] + [`InputSource`] + the executor traits + a
+/// [`JobSigner`]. Single-job MVP (TD-17: one `job_id`/tick; multi-job is a
+/// follow-on). Holds the per-job progress (and the committed flag) across ticks.
+pub struct JobExecutor<V, In, W, I, S> {
+    /// The job this executor is responsible for.
+    pub job_id: u128,
+    /// This provider's address (drive only jobs assigned to us).
+    pub me: Address,
+    /// The marketplace contract (the `to` of lifecycle writes).
+    pub marketplace: Address,
+    /// Chain id (40204).
+    pub chain_id: u64,
+    /// Where to cache provisioned weights.
+    pub cache_dir: PathBuf,
+    /// The per-job commitment nonce (unpredictable; generated once at startup).
+    pub nonce: [u8; 32],
+    pub view: V,
+    pub input: In,
+    pub weights: W,
+    pub inference: I,
+    pub signer: S,
+    /// Per-job state carried across ticks (commitment flag + cached artifacts).
+    pub progress: tokio::sync::Mutex<JobProgress>,
+}
+
+impl<V, In, W, I, S> JobExecutor<V, In, W, I, S>
+where
+    V: JobView + Sync,
+    In: InputSource + Sync,
+    W: WeightSource + Sync,
+    I: Inference + Sync,
+    S: JobSigner + Sync,
+{
+    /// Resolve the configured job and advance it one step. Public for tests; the
+    /// loop calls [`TickExecutor::tick`].
+    pub async fn step(&self, state: &SharedState) -> StepOutcome {
+        let resolved = match self.view.resolve(self.job_id).await {
+            Ok(r) => r,
+            Err(e) => return record_error(state, format!("resolve job {}: {e}", self.job_id)).await,
+        };
+
+        // Only drive jobs assigned to us; otherwise it's not our turn.
+        if resolved.job.assigned_provider != self.me {
+            return StepOutcome::Idle;
+        }
+
+        let mut progress = self.progress.lock().await;
+
+        // The RunInference step needs the off-chain input; nothing else does. If
+        // we're about to run inference and the input hasn't arrived, hold.
+        let need_input = resolved.job.state == JobState::Executing && progress.artifacts.is_none();
+        let input = if need_input {
+            match self.input.input_for(self.job_id).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return StepOutcome::AwaitingInput,
+                Err(e) => {
+                    return record_error(state, format!("input for job {}: {e}", self.job_id)).await
+                }
+            }
+        } else {
+            Vec::new() // unused for non-inference steps
+        };
+
+        let ctx = JobContext {
+            job: resolved.job,
+            current_block: resolved.current_block,
+            marketplace: self.marketplace,
+            chain_id: self.chain_id,
+            me: self.me,
+            ipfs_cid: resolved.ipfs_cid,
+            is_active: resolved.is_active,
+            expected_size: resolved.expected_size,
+            input,
+            cache_dir: self.cache_dir.clone(),
+        };
+
+        drive_job(
+            &ctx,
+            &mut progress,
+            state,
+            &self.weights,
+            &self.inference,
+            &self.signer,
+            self.nonce,
+        )
+        .await
+    }
+}
+
+/// A per-tick driver the loop runs after bidding. [`NoExecutor`] is the bid-only
+/// no-op; [`JobExecutor`] drives a won job.
+pub trait TickExecutor {
+    fn tick(&self, state: &SharedState) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// No-op executor for the bid-only loop (no SELL-S2 job configured).
+pub struct NoExecutor;
+
+impl TickExecutor for NoExecutor {
+    async fn tick(&self, _state: &SharedState) {}
+}
+
+impl<V, In, W, I, S> TickExecutor for JobExecutor<V, In, W, I, S>
+where
+    V: JobView + Sync,
+    In: InputSource + Sync,
+    W: WeightSource + Sync,
+    I: Inference + Sync,
+    S: JobSigner + Sync,
+{
+    async fn tick(&self, state: &SharedState) {
+        // The outcome is already recorded into shared state (errors/aborts) and
+        // the signer (emitted requests); a tick just advances one step.
+        let _ = self.step(state).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +345,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     const ME: Address = [0xab; 20];
+    const OTHER: Address = [0xcd; 20];
     const MARKETPLACE: Address = [0x11; 20];
 
     fn shared() -> SharedState {
@@ -368,5 +525,108 @@ mod tests {
         assert_eq!(o, StepOutcome::Aborted(AbortReason::ExecutionDeadlinePassed));
         assert_eq!(state.read().await.health_at(0).active_jobs, 0);
         assert!(signer.recorded().is_empty());
+    }
+
+    // ── JobExecutor (live-loop orchestration) ───────────────────────────────
+
+    fn resolved(state: JobState, assigned: Address) -> ResolvedJob {
+        let mut j = job(state);
+        j.assigned_provider = assigned;
+        ResolvedJob {
+            job: j,
+            ipfs_cid: "bafycid".into(),
+            is_active: true,
+            expected_size: Some(7),
+            current_block: 200,
+        }
+    }
+
+    struct FakeView(ResolvedJob);
+    impl JobView for FakeView {
+        async fn resolve(&self, _id: u128) -> Result<ResolvedJob, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct HasInput;
+    impl InputSource for HasInput {
+        async fn input_for(&self, _id: u128) -> Result<Option<Vec<u8>>, String> {
+            Ok(Some(b"the prompt".to_vec()))
+        }
+    }
+    struct NoInput;
+    impl InputSource for NoInput {
+        async fn input_for(&self, _id: u128) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+
+    fn executor<In: InputSource>(
+        rj: ResolvedJob,
+        input: In,
+        cache: &str,
+    ) -> JobExecutor<FakeView, In, Weights, Echo, UnsignedJobSigner> {
+        let dir = std::env::temp_dir().join(format!("citrate-jobexec-{cache}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        JobExecutor {
+            job_id: 7,
+            me: ME,
+            marketplace: MARKETPLACE,
+            chain_id: 40204,
+            cache_dir: dir,
+            nonce: [0x42; 32],
+            view: FakeView(rj),
+            input,
+            weights: Weights,
+            inference: Echo,
+            signer: UnsignedJobSigner::new(),
+            progress: tokio::sync::Mutex::new(JobProgress::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_idle_when_job_not_assigned_to_us() {
+        let state = shared();
+        let exec = executor(resolved(JobState::Assigned, OTHER), NoInput, "notassigned");
+        assert_eq!(exec.step(&state).await, StepOutcome::Idle);
+        assert!(exec.signer.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_awaits_off_chain_input_before_inference() {
+        let state = shared();
+        let exec = executor(resolved(JobState::Executing, ME), NoInput, "awaitinput");
+        assert_eq!(exec.step(&state).await, StepOutcome::AwaitingInput);
+        // No artifacts produced, no writes emitted — purely holds.
+        assert!(exec.progress.lock().await.artifacts.is_none());
+        assert!(exec.signer.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_signs_start_execution_when_assigned() {
+        let state = shared();
+        // Assigned doesn't need input.
+        let exec = executor(resolved(JobState::Assigned, ME), NoInput, "start");
+        assert_eq!(
+            exec.step(&state).await,
+            StepOutcome::Signed(WriteIntent::StartExecution)
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_runs_inference_when_executing_with_input() {
+        let state = shared();
+        let exec = executor(resolved(JobState::Executing, ME), HasInput, "infer");
+        assert_eq!(exec.step(&state).await, StepOutcome::RanInference);
+        assert!(exec.progress.lock().await.artifacts.is_some());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("citrate-jobexec-infer"));
+    }
+
+    #[tokio::test]
+    async fn no_executor_tick_is_a_noop() {
+        let state = shared();
+        NoExecutor.tick(&state).await;
+        // Nothing recorded — purely a no-op for the bid-only loop.
+        assert_eq!(state.read().await.health_at(0).active_jobs, 0);
     }
 }

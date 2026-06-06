@@ -23,13 +23,11 @@
 mod bridge;
 mod clock;
 mod daemon;
-// SELL-S2 job-execution orchestration: complete + unit-tested (drives a won job
-// provision→infer→prove→submit→complete via the unsigned JobSigner seam). Its
-// run-loop call site — detecting "a job was assigned to me" (event scan), a live
-// `getJob`/`getModel` JobView, and the signing relay — is the TD-17 follow-up, so
-// the binary does not invoke it yet. `allow(dead_code)` marks that staged seam
-// (not a stub: the module is real and tested).
-#[allow(dead_code)]
+// SELL-S2 job-execution orchestration: drives a won job
+// provision→infer→prove→submit→complete via the unsigned JobSigner seam. Wired
+// into the daemon loop below (`build_job_executor` → `run_loop`'s executor). The
+// remaining external pieces — the off-chain input transport beyond a watched
+// directory, and the signing/broadcast *relay* — are the TD-27/TD-17 follow-ups.
 mod execution;
 mod live;
 
@@ -249,7 +247,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     let provider_addr = std::env::var("CITRATE_PROVIDER_ADDRESS").ok();
     match (rpc_url, provider_addr) {
         (Some(rpc_url), Some(provider_hex)) => {
-            let client = chainio::rpc::RpcClient::new(rpc_url);
+            let client = chainio::rpc::RpcClient::new(rpc_url.clone());
             let chain_id = client.eth_chain_id().await?;
             if chain_id != chainio::CHAIN_ID {
                 return Err(format!(
@@ -258,26 +256,58 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                 )
                 .into());
             }
+            let marketplace = abi::address_from_hex(chainio::compute_marketplace())?;
+            let model_registry = abi::address_from_hex(chainio::model_registry())?;
+            let provider = abi::address_from_hex(&provider_hex)?;
             let view = live::LiveMarketView {
                 client,
-                marketplace: abi::address_from_hex(chainio::compute_marketplace())?,
+                marketplace,
                 oracle: abi::address_from_hex(chainio::compute_pricing_oracle())?,
-                provider: abi::address_from_hex(&provider_hex)?,
+                provider,
                 job_id,
                 estimated_pflop_hours_1e18: DEFAULT_PFLOP_HOURS_1E18,
                 estimated_exec_secs: DEFAULT_EXEC_SECS,
             };
             let sender = live::UnsignedHeartbeatSender;
-            println!("node-agent daemon: live loop on chain {chain_id}, job #{job_id}");
-            daemon::run_loop(
-                state,
-                &view,
-                &sender,
-                &bid_settings,
-                heartbeat::HEARTBEAT_INTERVAL,
-                None,
-            )
-            .await;
+
+            // SELL-S2 execution wiring: drive the configured job when the
+            // execution backends are all configured; otherwise bid-only.
+            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id)? {
+                Some(exec) => {
+                    println!(
+                        "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
+                         EXECUTION enabled (unsigned signer: emits requests for gui-native to \
+                         sign; the broadcast/observe relay is TD-17/27)"
+                    );
+                    daemon::run_loop(
+                        state,
+                        &view,
+                        &sender,
+                        &exec,
+                        &bid_settings,
+                        heartbeat::HEARTBEAT_INTERVAL,
+                        None,
+                    )
+                    .await;
+                }
+                None => {
+                    println!(
+                        "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
+                         bid-only (set CITRATE_IPFS_GATEWAY + CITRATE_LLAMA_URL + \
+                         CITRATE_JOB_INPUT_DIR to execute won jobs)"
+                    );
+                    daemon::run_loop(
+                        state,
+                        &view,
+                        &sender,
+                        &execution::NoExecutor,
+                        &bid_settings,
+                        heartbeat::HEARTBEAT_INTERVAL,
+                        None,
+                    )
+                    .await;
+                }
+            }
         }
         _ => {
             println!(
@@ -293,4 +323,59 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     }
 
     Ok(())
+}
+
+/// The concrete live SELL-S2 executor: live chain reads + watched-dir input +
+/// IPFS-gateway weights + resident llama-server inference + the unsigned signer.
+type LiveJobExecutor = execution::JobExecutor<
+    live::LiveJobView,
+    live::FileInputSource,
+    executor::IpfsGatewaySource,
+    executor::LlamaServerInference,
+    lifecycle::UnsignedJobSigner,
+>;
+
+/// Build the live job executor if the execution backends are configured, else
+/// `None` (bid-only). Requires `CITRATE_IPFS_GATEWAY` (weights), `CITRATE_LLAMA_URL`
+/// (inference), and `CITRATE_JOB_INPUT_DIR` (the off-chain input drop); the model
+/// cache dir defaults but can be overridden with `CITRATE_MODEL_CACHE_DIR`.
+fn build_job_executor(
+    rpc_url: &str,
+    marketplace: chainio::abi::Address,
+    model_registry: chainio::abi::Address,
+    me: chainio::abi::Address,
+    job_id: u128,
+    chain_id: u64,
+) -> Result<Option<LiveJobExecutor>, Box<dyn std::error::Error>> {
+    let (Some(gateway), Some(llama), Some(input_dir)) = (
+        std::env::var("CITRATE_IPFS_GATEWAY").ok(),
+        std::env::var("CITRATE_LLAMA_URL").ok(),
+        std::env::var("CITRATE_JOB_INPUT_DIR").ok(),
+    ) else {
+        return Ok(None);
+    };
+    let cache_dir = std::env::var("CITRATE_MODEL_CACHE_DIR")
+        .unwrap_or_else(|_| "/var/lib/citrate-node-agent/models".to_string());
+    let nonce = live::random_nonce()?;
+
+    Ok(Some(execution::JobExecutor {
+        job_id,
+        me,
+        marketplace,
+        chain_id,
+        cache_dir: cache_dir.into(),
+        nonce,
+        view: live::LiveJobView {
+            client: chainio::rpc::RpcClient::new(rpc_url.to_string()),
+            marketplace,
+            model_registry,
+        },
+        input: live::FileInputSource {
+            dir: input_dir.into(),
+        },
+        weights: executor::IpfsGatewaySource::new(gateway),
+        inference: executor::LlamaServerInference::new(llama),
+        signer: lifecycle::UnsignedJobSigner::new(),
+        progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
+    }))
 }
