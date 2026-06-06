@@ -30,6 +30,7 @@ mod daemon;
 // directory, and the signing/broadcast *relay* — are the TD-27/TD-17 follow-ups.
 mod execution;
 mod live;
+mod profiler;
 mod relay;
 
 use std::sync::Arc;
@@ -40,12 +41,34 @@ use chainio::abi;
 use config::ComputeSettings;
 use tokio::sync::RwLock;
 
-/// Default per-job work estimate used until the executor's profiler lands (S2):
-/// 0.5 pflop-hours (×1e18) and a 5-minute typical execution time. These are the
-/// agent's own estimates, not chain data; they feed cost-plus pricing and the
-/// deadline-feasibility gate.
-const DEFAULT_PFLOP_HOURS_1E18: u128 = 500_000_000_000_000_000; // 0.5 ×1e18
+/// Fallback per-model execution-time estimate (seconds) before a model has been
+/// profiled from a real run (TD-10). Feeds the deadline-feasibility gate.
 const DEFAULT_EXEC_SECS: u64 = 300;
+/// Default node throughput (pflops ×1e18) used to derive pflop-hours from the
+/// measured/estimated execution time. 6 pflops × (300s/3600) = 0.5 pflop-hours,
+/// reproducing the old SELL-S1 default for an unprofiled node. Override with
+/// `CITRATE_NODE_PFLOPS_1E18`.
+const DEFAULT_NODE_PFLOPS_1E18: u128 = 6_000_000_000_000_000_000;
+/// Blocks to sample when deriving seconds-per-block from chain timestamps.
+const SECS_PER_BLOCK_SAMPLE: u128 = 20;
+
+/// Build the per-model profiler from config (the node's throughput).
+fn build_profiler() -> std::sync::Arc<profiler::ModelProfiler> {
+    let node_pflops = std::env::var("CITRATE_NODE_PFLOPS_1E18")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NODE_PFLOPS_1E18);
+    std::sync::Arc::new(profiler::ModelProfiler::new(node_pflops, DEFAULT_EXEC_SECS))
+}
+
+/// Derive seconds-per-block from chain timestamps, falling back to the default
+/// when it can't be sampled (idle devnet / too few blocks).
+async fn derive_secs_per_block(client: &chainio::rpc::RpcClient) -> u64 {
+    match client.secs_per_block(SECS_PER_BLOCK_SAMPLE).await {
+        Ok(Some(s)) => s,
+        _ => bridge::DEFAULT_SECS_PER_BLOCK,
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -176,12 +199,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         job.id, job.max_price_wei, job.tier, job.state, job.execution_deadline_block, current_block
     );
 
-    let bid_job = bridge::map_job(
-        &job,
-        current_block,
-        DEFAULT_PFLOP_HOURS_1E18,
-        DEFAULT_EXEC_SECS,
-    );
+    // Chain-derived block time + per-model estimate (defaults until profiled).
+    let secs_per_block = derive_secs_per_block(&client).await;
+    let (pflop_hours, exec_secs) = build_profiler().estimate(&job.model_hash);
+    let bid_job = bridge::map_job(&job, current_block, secs_per_block, pflop_hours, exec_secs);
 
     // 4. Decision.
     let decision = bidder::evaluate(&bid_job, &oracle, &bid_settings, &caps);
@@ -260,14 +281,21 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
             let marketplace = abi::address_from_hex(chainio::compute_marketplace())?;
             let model_registry = abi::address_from_hex(chainio::model_registry())?;
             let provider = abi::address_from_hex(&provider_hex)?;
+
+            // TD-10: chain-derived block time + per-model profiler (shared between
+            // the bidder's market view and the executor that records real runs).
+            let secs_per_block = derive_secs_per_block(&client).await;
+            let profiler = build_profiler();
+            println!("node-agent daemon: block time {secs_per_block}s/block (chain-derived)");
+
             let view = live::LiveMarketView {
                 client,
                 marketplace,
                 oracle: abi::address_from_hex(chainio::compute_pricing_oracle())?,
                 provider,
                 job_id,
-                estimated_pflop_hours_1e18: DEFAULT_PFLOP_HOURS_1E18,
-                estimated_exec_secs: DEFAULT_EXEC_SECS,
+                profiler: profiler.clone(),
+                secs_per_block,
             };
             let sender = live::UnsignedHeartbeatSender;
 
@@ -299,7 +327,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
 
             // SELL-S2 execution wiring: drive the configured job when the
             // execution backends are all configured; otherwise bid + earn only.
-            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id, signer)? {
+            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id, signer, profiler.clone())? {
                 Some(exec) => {
                     println!(
                         "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
@@ -367,6 +395,7 @@ type LiveJobExecutor = execution::JobExecutor<
 /// `None` (bid-only). Requires `CITRATE_IPFS_GATEWAY` (weights), `CITRATE_LLAMA_URL`
 /// (inference), and `CITRATE_JOB_INPUT_DIR` (the off-chain input drop); the model
 /// cache dir defaults but can be overridden with `CITRATE_MODEL_CACHE_DIR`.
+#[allow(clippy::too_many_arguments)] // distinct chain/exec params; bundling adds noise
 fn build_job_executor(
     rpc_url: &str,
     marketplace: chainio::abi::Address,
@@ -375,6 +404,7 @@ fn build_job_executor(
     job_id: u128,
     chain_id: u64,
     signer: relay::RelaySigner,
+    profiler: std::sync::Arc<profiler::ModelProfiler>,
 ) -> Result<Option<LiveJobExecutor>, Box<dyn std::error::Error>> {
     let (Some(gateway), Some(llama), Some(input_dir)) = (
         std::env::var("CITRATE_IPFS_GATEWAY").ok(),
@@ -406,6 +436,7 @@ fn build_job_executor(
         weights: executor::IpfsGatewaySource::new(gateway),
         inference: executor::LlamaServerInference::new(llama),
         signer,
+        profiler,
         progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
     }))
 }

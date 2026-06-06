@@ -25,6 +25,7 @@
 
 use std::path::PathBuf;
 
+use crate::profiler::ModelProfiler;
 use chainio::abi::Address;
 use chainio::marketplace::{Job, JobState};
 use executor::{provision, CommitmentProver, Inference, ProofMaker, WeightSource};
@@ -96,6 +97,7 @@ pub enum StepOutcome {
 ///
 /// `nonce_seed` is the daemon-supplied per-job nonce (unpredictable; generated
 /// once when the job is first executed and stable thereafter via `progress.nonce`).
+#[allow(clippy::too_many_arguments)] // distinct injected deps; bundling would obscure
 pub async fn drive_job<W, I, S>(
     ctx: &JobContext,
     progress: &mut JobProgress,
@@ -104,6 +106,7 @@ pub async fn drive_job<W, I, S>(
     inference: &I,
     signer: &S,
     nonce_seed: [u8; 32],
+    profiler: Option<&ModelProfiler>,
 ) -> StepOutcome
 where
     W: WeightSource + Sync,
@@ -136,10 +139,16 @@ where
                 Ok(m) => m,
                 Err(e) => return record_error(state, format!("provision: {e}")).await,
             };
+            let started = std::time::Instant::now();
             let output = match inference.run(&model, &ctx.input).await {
                 Ok(o) => o,
                 Err(e) => return record_error(state, format!("inference: {e}")).await,
             };
+            // Feed the measured execution time back into the per-model profiler
+            // so the next bid's estimate tracks reality (TD-10).
+            if let Some(p) = profiler {
+                p.record(ctx.job.model_hash, started.elapsed().as_secs());
+            }
             let nonce = progress.nonce.unwrap_or(nonce_seed);
             progress.nonce = Some(nonce);
             progress.artifacts = Some(CommitmentProver.build(&output.bytes, nonce));
@@ -238,6 +247,8 @@ pub struct JobExecutor<V, In, W, I, S> {
     pub weights: W,
     pub inference: I,
     pub signer: S,
+    /// Per-model execution-time profiler (shared with the bidder's market view).
+    pub profiler: std::sync::Arc<ModelProfiler>,
     /// Per-job state carried across ticks (commitment flag + cached artifacts).
     pub progress: tokio::sync::Mutex<JobProgress>,
 }
@@ -304,6 +315,7 @@ where
             &self.inference,
             &self.signer,
             self.nonce,
+            Some(&self.profiler),
         )
         .await
     }
@@ -489,12 +501,12 @@ mod tests {
 
         // 1. Assigned → startExecution.
         let mut c = ctx(JobState::Assigned, "complete");
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::StartExecution));
 
         // 2. Executing, no artifacts → run inference.
         c.job.state = JobState::Executing;
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::RanInference);
         assert!(progress.artifacts.is_some());
         assert_eq!(progress.nonce, Some(nonce));
@@ -502,7 +514,7 @@ mod tests {
         assert_eq!(state.read().await.health_at(0).active_jobs, 1);
 
         // 3. Executing, artifacts, not committed → submitCommitment.
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::SubmitCommitment));
 
         // The relay signs + broadcasts the commitment; chain now reflects it.
@@ -511,17 +523,17 @@ mod tests {
         progress.committed = true;
 
         // 4. Executing, committed → submitResult.
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::SubmitResult));
 
         // 5. Verifying → completeJob.
         c.job.state = JobState::Verifying;
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::CompleteJob));
 
         // 6. Completed → Done; slot released.
         c.job.state = JobState::Completed;
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Done);
         assert_eq!(state.read().await.health_at(0).active_jobs, 0);
 
@@ -562,7 +574,7 @@ mod tests {
         let signer = UnsignedJobSigner::new();
         let mut progress = JobProgress::default();
         let c = ctx(JobState::Executing, "failwrite");
-        let o = drive_job(&c, &mut progress, &state, &FailWeights, &Echo, &signer, [0u8; 32]).await;
+        let o = drive_job(&c, &mut progress, &state, &FailWeights, &Echo, &signer, [0u8; 32], None).await;
         match o {
             StepOutcome::Error(m) => assert!(m.contains("provision")),
             other => panic!("expected Error, got {other:?}"),
@@ -591,7 +603,7 @@ mod tests {
         };
         let mut c = ctx(JobState::Executing, "deadline");
         c.current_block = 2_000; // > execution_deadline_block (1000)
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, [0u8; 32]).await;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, [0u8; 32], None).await;
         assert_eq!(o, StepOutcome::Aborted(AbortReason::ExecutionDeadlinePassed));
         assert_eq!(state.read().await.health_at(0).active_jobs, 0);
         assert!(signer.recorded().is_empty());
@@ -655,6 +667,7 @@ mod tests {
             weights: Weights,
             inference: Echo,
             signer: UnsignedJobSigner::new(),
+            profiler: std::sync::Arc::new(ModelProfiler::new(6_000_000_000_000_000_000, 300)),
             progress: tokio::sync::Mutex::new(JobProgress::default()),
         }
     }
@@ -727,6 +740,10 @@ mod tests {
         let exec = executor(resolved(JobState::Executing, ME), HasInput, "infer");
         assert_eq!(exec.step(&state).await, StepOutcome::RanInference);
         assert!(exec.progress.lock().await.artifacts.is_some());
+        // The run was profiled (TD-10): the model's estimate is now the measured
+        // ~0s (Echo is instant) clamped to 1 — no longer the 300s default.
+        let model_hash = job(JobState::Executing).model_hash;
+        assert_eq!(exec.profiler.estimate(&model_hash).1, 1);
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("citrate-jobexec-infer"));
     }
 

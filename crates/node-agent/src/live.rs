@@ -26,11 +26,10 @@ pub struct LiveMarketView {
     pub oracle: Address,
     pub provider: Address,
     pub job_id: u128,
-    /// Agent's own per-job work estimate (pflop-hours ×1e18) until the profiler
-    /// lands (S2).
-    pub estimated_pflop_hours_1e18: u128,
-    /// Agent's own typical execution-time estimate (seconds).
-    pub estimated_exec_secs: u64,
+    /// Per-model work estimates from the executor's real runs (TD-10).
+    pub profiler: std::sync::Arc<crate::profiler::ModelProfiler>,
+    /// Chain-derived seconds-per-block for the deadline conversion (TD-10).
+    pub secs_per_block: u64,
 }
 
 impl MarketView for LiveMarketView {
@@ -65,11 +64,14 @@ impl MarketView for LiveMarketView {
             .eth_block_number()
             .await
             .map_err(|e| format!("blockNumber: {e}"))?;
+        // Per-model work estimate from real runs (defaults until first profiled).
+        let (pflop_hours, exec_secs) = self.profiler.estimate(&chain_job.model_hash);
         let job = bridge::map_job(
             &chain_job,
             current_block,
-            self.estimated_pflop_hours_1e18,
-            self.estimated_exec_secs,
+            self.secs_per_block,
+            pflop_hours,
+            exec_secs,
         );
 
         Ok(MarketSnapshot {
