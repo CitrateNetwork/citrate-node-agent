@@ -13,6 +13,7 @@
 //!   calls SELL-S1 needs: `getProvider`, `getJob`, `saltPerPflopHour`.
 
 pub mod abi;
+pub mod accounting;
 pub mod addrbook;
 pub mod marketplace;
 pub mod model_registry;

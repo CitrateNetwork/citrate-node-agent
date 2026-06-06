@@ -39,7 +39,7 @@ use chainio::marketplace::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureRequest {
     /// Which lifecycle write this is (for the signer UI + the daemon's tracking).
-    pub intent: JobIntent,
+    pub intent: WriteIntent,
     /// Target contract (the marketplace).
     pub to: Address,
     /// ABI calldata (built by `chainio`).
@@ -56,23 +56,30 @@ pub struct SignatureRequest {
     pub expires_block: u128,
 }
 
-/// The four marketplace writes that walk a won job to payout.
+/// An on-chain write the node-agent emits (unsigned) for a signing surface.
+/// The four `*Job`/`*Execution`/`*Commitment`/`*Result` variants walk a won job
+/// to payout (driven by [`plan`]); `ClaimRewards` is the earnings sweep (built by
+/// the `earnings` crate). One enum so the daemon has a single signer seam for
+/// every write it requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobIntent {
+pub enum WriteIntent {
     StartExecution,
     SubmitCommitment,
     SubmitResult,
     CompleteJob,
+    /// `ContributionAccounting.claimRewards()` — sweep accrued earnings.
+    ClaimRewards,
 }
 
-impl JobIntent {
+impl WriteIntent {
     /// The Solidity function name, for the signing-surface label.
     pub fn label(self) -> &'static str {
         match self {
-            JobIntent::StartExecution => "startExecution",
-            JobIntent::SubmitCommitment => "submitCommitment",
-            JobIntent::SubmitResult => "submitResult",
-            JobIntent::CompleteJob => "completeJob",
+            WriteIntent::StartExecution => "startExecution",
+            WriteIntent::SubmitCommitment => "submitCommitment",
+            WriteIntent::SubmitResult => "submitResult",
+            WriteIntent::CompleteJob => "completeJob",
+            WriteIntent::ClaimRewards => "claimRewards",
         }
     }
 }
@@ -162,7 +169,7 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.me != job.assigned_provider {
                 return LifecycleAction::Abort(AbortReason::NotAssignedProvider);
             }
-            sign(JobIntent::StartExecution, encode_start_execution(job.id), input)
+            sign(WriteIntent::StartExecution, encode_start_execution(job.id), input)
         }
 
         JobState::Executing => {
@@ -176,7 +183,7 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if !input.committed {
                 // Commitment must precede the result (ComputeVerifier INV-3/7).
                 return sign(
-                    JobIntent::SubmitCommitment,
+                    WriteIntent::SubmitCommitment,
                     encode_submit_commitment(job.id, art.commitment),
                     input,
                 );
@@ -186,7 +193,7 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
                 return LifecycleAction::Abort(AbortReason::ExecutionDeadlinePassed);
             }
             sign(
-                JobIntent::SubmitResult,
+                WriteIntent::SubmitResult,
                 encode_submit_result(job.id, &art.output_hash, &art.proof),
                 input,
             )
@@ -198,7 +205,7 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.me != job.assigned_provider {
                 return LifecycleAction::Abort(AbortReason::NotAssignedProvider);
             }
-            sign(JobIntent::CompleteJob, encode_complete_job(job.id), input)
+            sign(WriteIntent::CompleteJob, encode_complete_job(job.id), input)
         }
 
         JobState::Completed => LifecycleAction::Done,
@@ -210,10 +217,10 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
 }
 
 /// Wrap a built calldata into an unsigned [`SignatureRequest`] for `intent`.
-fn sign(intent: JobIntent, calldata: Vec<u8>, input: &PlanInput) -> LifecycleAction {
+fn sign(intent: WriteIntent, calldata: Vec<u8>, input: &PlanInput) -> LifecycleAction {
     let expires_block = match intent {
         // completeJob has no on-chain deadline.
-        JobIntent::CompleteJob => 0,
+        WriteIntent::CompleteJob => 0,
         // Execution-phase writes are bounded by the job's execution deadline.
         _ => input.job.execution_deadline_block,
     };
@@ -347,7 +354,7 @@ mod tests {
         }
     }
 
-    fn expect_sign(action: LifecycleAction, intent: JobIntent) -> SignatureRequest {
+    fn expect_sign(action: LifecycleAction, intent: WriteIntent) -> SignatureRequest {
         match action {
             LifecycleAction::Sign(req) => {
                 assert_eq!(req.intent, intent);
@@ -363,7 +370,7 @@ mod tests {
     #[test]
     fn assigned_emits_start_execution() {
         let j = job(7, JobState::Assigned, ME, 200);
-        let req = expect_sign(plan(&input(&j, 120, false, None)), JobIntent::StartExecution);
+        let req = expect_sign(plan(&input(&j, 120, false, None)), WriteIntent::StartExecution);
         assert_eq!(req.calldata, encode_start_execution(7));
         assert_eq!(req.context, "startExecution job 7");
         assert_eq!(req.expires_block, 200);
@@ -390,7 +397,7 @@ mod tests {
         let art = artifacts();
         let req = expect_sign(
             plan(&input(&j, 120, false, Some(&art))),
-            JobIntent::SubmitCommitment,
+            WriteIntent::SubmitCommitment,
         );
         assert_eq!(req.calldata, encode_submit_commitment(7, art.commitment));
     }
@@ -401,7 +408,7 @@ mod tests {
         let art = artifacts();
         let req = expect_sign(
             plan(&input(&j, 199, true, Some(&art))),
-            JobIntent::SubmitResult,
+            WriteIntent::SubmitResult,
         );
         assert_eq!(
             req.calldata,
@@ -428,14 +435,14 @@ mod tests {
         // block == deadline is still in-window (contract: block <= deadline).
         expect_sign(
             plan(&input(&j, 200, true, Some(&art))),
-            JobIntent::SubmitResult,
+            WriteIntent::SubmitResult,
         );
     }
 
     #[test]
     fn verifying_emits_complete_job() {
         let j = job(7, JobState::Verifying, ME, 200);
-        let req = expect_sign(plan(&input(&j, 220, true, None)), JobIntent::CompleteJob);
+        let req = expect_sign(plan(&input(&j, 220, true, None)), WriteIntent::CompleteJob);
         assert_eq!(req.calldata, encode_complete_job(7));
         assert_eq!(req.expires_block, 0); // no deadline on completion
     }
@@ -479,6 +486,6 @@ mod tests {
         let recorded = signer.recorded();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0], req);
-        assert_eq!(recorded[0].intent, JobIntent::StartExecution);
+        assert_eq!(recorded[0].intent, WriteIntent::StartExecution);
     }
 }

@@ -42,6 +42,10 @@ selector_fn!(get_provider_count, "getProviderCount()");
 // --- ModelRegistry (read) ---
 selector_fn!(get_model, "getModel(bytes32)");
 
+// --- ContributionAccounting (read claimable + write claimRewards) ---
+selector_fn!(claimable, "claimable(address)");
+selector_fn!(claim_rewards, "claimRewards()");
+
 // --- ComputeMarketplace (write — calldata builders live in `marketplace`) ---
 selector_fn!(register_provider, "registerProvider(bytes32[])");
 selector_fn!(bid_on_job, "bidOnJob(uint256,uint256,uint256)");
@@ -75,6 +79,9 @@ mod tests {
         assert_eq!(hex4(get_provider_count()), "0x46ce4175");
 
         assert_eq!(hex4(get_model()), "0x21e7c498");
+
+        assert_eq!(hex4(claimable()), "0x402914f5");
+        assert_eq!(hex4(claim_rewards()), "0x372500ab");
 
         assert_eq!(hex4(register_provider()), "0x0589cd44");
         assert_eq!(hex4(bid_on_job()), "0x18360fc2");
