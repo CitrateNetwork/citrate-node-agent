@@ -233,6 +233,31 @@ pub fn encode_complete_job(job_id: u128) -> Vec<u8> {
     abi::encode_call(selectors::complete_job(), &[abi::word_from_u128(job_id)])
 }
 
+/// `submitResult(uint256 jobId, bytes outputHash, bytes proof)`.
+///
+/// Two dynamic `bytes` arguments. The head is three words —
+/// `[ jobId | offset(outputHash) | offset(proof) ]` — where each offset is
+/// measured from the start of the argument block (immediately after the 4-byte
+/// selector). The two `bytes` tails follow in order. For the Commitment tier,
+/// `output_hash = keccak256(output)` and `proof = commitment(32)‖nonce(32)‖output`
+/// (the exact layout `ComputeVerifier._verifyCommitment` decodes).
+pub fn encode_submit_result(job_id: u128, output_hash: &[u8], proof: &[u8]) -> Vec<u8> {
+    const HEAD_LEN: usize = 3 * 32; // jobId + 2 offset words
+    let output_tail = abi::encode_bytes_tail(output_hash);
+    let proof_tail = abi::encode_bytes_tail(proof);
+    let off_output = HEAD_LEN as u128;
+    let off_proof = (HEAD_LEN + output_tail.len()) as u128;
+
+    let mut out = Vec::with_capacity(4 + HEAD_LEN + output_tail.len() + proof_tail.len());
+    out.extend_from_slice(&selectors::submit_result());
+    out.extend_from_slice(&abi::word_from_u128(job_id));
+    out.extend_from_slice(&abi::word_from_u128(off_output));
+    out.extend_from_slice(&abi::word_from_u128(off_proof));
+    out.extend_from_slice(&output_tail);
+    out.extend_from_slice(&proof_tail);
+    out
+}
+
 /// `registerProvider(bytes32[] supportedModels)`.
 ///
 /// One dynamic `bytes32[]` argument: head is a single offset word (0x20), tail
@@ -484,6 +509,36 @@ mod tests {
         assert_eq!(&call[0..4], &selectors::submit_commitment());
         assert_eq!(call[4 + 31], 3);
         assert_eq!(&call[4 + 32..4 + 64], &commitment);
+    }
+
+    #[test]
+    fn encodes_submit_result_calldata() {
+        // outputHash = keccak256(output) is 32 bytes.
+        let output_hash = [0x11u8; 32];
+        // Commitment-tier proofData: commitment(32) ‖ nonce(32) ‖ output (5 bytes).
+        let mut proof = Vec::new();
+        proof.extend_from_slice(&[0x22u8; 32]); // commitment
+        proof.extend_from_slice(&[0x33u8; 32]); // nonce
+        proof.extend_from_slice(b"hello"); // output → 69 bytes total, pads to 96
+
+        let call = encode_submit_result(5, &output_hash, &proof);
+        assert_eq!(&call[0..4], &selectors::submit_result());
+        let body = &call[4..];
+
+        // head word 0: jobId = 5
+        assert_eq!(body[31], 5);
+        // head word 1: offset(outputHash) = 0x60 (3 words in)
+        assert_eq!(body[32 + 31], 0x60);
+        // head word 2: offset(proof) = 0x60 + 64 (outputHash tail) = 0xa0
+        assert_eq!(body[64 + 31], 0xa0);
+        // outputHash tail: length word = 32, then the 32 data bytes
+        assert_eq!(body[96 + 31], 32);
+        assert_eq!(&body[128..160], &output_hash);
+        // proof tail: length word = 69, then commitment(0x22) leads the data
+        assert_eq!(body[160 + 31], 69);
+        assert_eq!(&body[192..224], &[0x22u8; 32]);
+        // total: selector + head(96) + outputHash tail(64) + proof tail(128)
+        assert_eq!(call.len(), 4 + 96 + 64 + 128);
     }
 
     #[test]

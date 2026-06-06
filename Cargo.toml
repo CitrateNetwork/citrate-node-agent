@@ -5,6 +5,7 @@ members = [
     "crates/config",
     "crates/bidder",
     "crates/heartbeat",
+    "crates/lifecycle",
     "crates/supervision",
     "crates/node-agent",
 ]
