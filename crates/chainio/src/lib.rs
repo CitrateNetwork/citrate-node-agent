@@ -19,6 +19,7 @@ pub mod marketplace;
 pub mod model_registry;
 pub mod rpc;
 pub mod selectors;
+pub mod verifier;
 
 // Re-export the address-book surface at the crate root so existing callers and
 // the canonical-address tripwire keep their `chainio::compute_marketplace()`

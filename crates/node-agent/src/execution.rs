@@ -150,14 +150,11 @@ where
             state.write().await.set_active_jobs(1);
             let intent = req.intent;
             match signer.request(req).await {
-                Ok(_) => {
-                    // Optimistic: the on-chain state stays Executing across
-                    // commitment → result, so we track locally that we've sent it.
-                    if intent == WriteIntent::SubmitCommitment {
-                        progress.committed = true;
-                    }
-                    StepOutcome::Signed(intent)
-                }
+                // The request is queued for the signing relay; whether the
+                // commitment has actually landed is read from chain
+                // (`PlanInput.committed`), so `submitResult` can never race ahead
+                // of `submitCommitment`. The signer is idempotent on re-emits.
+                Ok(_) => StepOutcome::Signed(intent),
                 Err(e) => record_error(state, format!("sign {}: {e}", intent.label())).await,
             }
         }
@@ -194,6 +191,9 @@ pub struct ResolvedJob {
     pub is_active: bool,
     pub expected_size: Option<u64>,
     pub current_block: u128,
+    /// Whether the commitment has been recorded on-chain (ComputeVerifier
+    /// `commitmentSubmitted`) — chain truth that gates `submitResult`.
+    pub committed: bool,
 }
 
 /// Reads a job's on-chain state + model location. The live impl does
@@ -264,6 +264,9 @@ where
         }
 
         let mut progress = self.progress.lock().await;
+        // Commitment status is chain truth, not optimistic local state, so a
+        // re-emit is safe and `submitResult` waits for the commitment to land.
+        progress.committed = resolved.committed;
 
         // The RunInference step needs the off-chain input; nothing else does. If
         // we're about to run inference and the input hasn't arrived, hold.
@@ -501,7 +504,11 @@ mod tests {
         // 3. Executing, artifacts, not committed → submitCommitment.
         let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::SubmitCommitment));
-        assert!(progress.committed);
+
+        // The relay signs + broadcasts the commitment; chain now reflects it.
+        // (Live, this comes from ComputeVerifier.commitmentSubmitted via the
+        // JobView; here we set it directly to simulate that chain truth.)
+        progress.committed = true;
 
         // 4. Executing, committed → submitResult.
         let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce).await;
@@ -593,6 +600,10 @@ mod tests {
     // ── JobExecutor (live-loop orchestration) ───────────────────────────────
 
     fn resolved(state: JobState, assigned: Address) -> ResolvedJob {
+        resolved_committed(state, assigned, false)
+    }
+
+    fn resolved_committed(state: JobState, assigned: Address, committed: bool) -> ResolvedJob {
         let mut j = job(state);
         j.assigned_provider = assigned;
         ResolvedJob {
@@ -601,6 +612,7 @@ mod tests {
             is_active: true,
             expected_size: Some(7),
             current_block: 200,
+            committed,
         }
     }
 
@@ -673,6 +685,39 @@ mod tests {
         assert_eq!(
             exec.step(&state).await,
             StepOutcome::Signed(WriteIntent::StartExecution)
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_submits_result_only_once_committed_on_chain() {
+        let state = shared();
+        let exec = executor(resolved_committed(JobState::Executing, ME, true), NoInput, "result");
+        // Pre-seed artifacts (inference already ran a prior tick).
+        {
+            let mut p = exec.progress.lock().await;
+            p.artifacts = Some(executor::CommitmentProver.build(b"out", [0x1; 32]));
+            p.nonce = Some([0x1; 32]);
+        }
+        // commitmentSubmitted=true on-chain → result step.
+        assert_eq!(
+            exec.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitResult)
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_waits_at_commitment_until_chain_confirms() {
+        let state = shared();
+        // Same as above but commitmentSubmitted=false → still the commitment step.
+        let exec = executor(resolved_committed(JobState::Executing, ME, false), NoInput, "wait");
+        {
+            let mut p = exec.progress.lock().await;
+            p.artifacts = Some(executor::CommitmentProver.build(b"out", [0x1; 32]));
+            p.nonce = Some([0x1; 32]);
+        }
+        assert_eq!(
+            exec.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitCommitment)
         );
     }
 

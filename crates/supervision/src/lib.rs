@@ -18,4 +18,4 @@ pub mod server;
 pub mod state;
 
 pub use server::{resolve_addr, router, serve, SharedState, ADDR_ENV, DEFAULT_ADDR};
-pub use state::{AgentState, Health, LifecycleState};
+pub use state::{AgentState, Health, LifecycleState, PendingSignatureRequest};

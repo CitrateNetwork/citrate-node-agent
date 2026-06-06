@@ -71,6 +71,38 @@ pub struct Health {
     pub last_error: Option<String>,
 }
 
+/// One unsigned chain write the daemon needs a signing surface (gui-native /
+/// relay) to sign + broadcast. Served by `GET /signature-requests`; the surface
+/// reports back via `POST /signature-requests/{id}/observed`.
+///
+/// Numeric `value_wei`/`expires_block` are decimal **strings** so a JS/JSON
+/// consumer never loses precision on a `u128`. Held free of chain/key types —
+/// the daemon converts raw bytes/addresses to hex before enqueueing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingSignatureRequest {
+    /// Stable id for the observe callback.
+    pub id: u64,
+    /// The write's function name (`startExecution`, `submitCommitment`, …).
+    pub intent: String,
+    /// Target contract, `0x`-hex.
+    pub to: String,
+    /// ABI calldata, `0x`-hex.
+    pub calldata: String,
+    /// Wei to send, decimal string (0 for the SELL-S2 writes).
+    pub value_wei: String,
+    /// Chain id the tx must be signed for.
+    pub chain_id: u64,
+    /// Human-readable description for the signing UI.
+    pub context: String,
+    /// Advisory block height past which signing is pointless (decimal string).
+    pub expires_block: String,
+    /// `"pending"` (awaiting signing) or `"submitted"` (broadcast + observed).
+    pub status: String,
+    /// The broadcast tx hash once observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+}
+
 /// Monotonic-ish wall clock used for heartbeat-age math. Pulled out behind a
 /// function so tests can drive it deterministically.
 fn now_unix_secs() -> u64 {
@@ -102,6 +134,10 @@ pub struct AgentState {
     last_heartbeat_unix: Option<u64>,
     /// Last recorded error string, if any.
     last_error: Option<String>,
+    /// Unsigned chain writes queued for the signing surface (the relay).
+    pending_requests: Vec<PendingSignatureRequest>,
+    /// Monotonic id source for `pending_requests`.
+    next_request_id: u64,
 }
 
 impl AgentState {
@@ -178,6 +214,61 @@ impl AgentState {
     /// Record (or clear, with `None`) the last error string.
     pub fn set_last_error(&mut self, err: Option<String>) {
         self.last_error = err;
+    }
+
+    // ---- signing relay queue (the daemon enqueues; the GUI/relay drains) ----
+
+    /// Enqueue an unsigned chain write for the signing surface. **Idempotent by
+    /// `calldata`**: re-emitting the same write (which the daemon does every tick
+    /// until the chain advances) returns the existing id instead of duplicating —
+    /// so the relay never double-broadcasts. Returns the request id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_signature_request(
+        &mut self,
+        intent: String,
+        to: String,
+        calldata: String,
+        value_wei: u128,
+        chain_id: u64,
+        context: String,
+        expires_block: u128,
+    ) -> u64 {
+        if let Some(existing) = self.pending_requests.iter().find(|r| r.calldata == calldata) {
+            return existing.id;
+        }
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.pending_requests.push(PendingSignatureRequest {
+            id,
+            intent,
+            to,
+            calldata,
+            value_wei: value_wei.to_string(),
+            chain_id,
+            context,
+            expires_block: expires_block.to_string(),
+            status: "pending".to_string(),
+            tx_hash: None,
+        });
+        id
+    }
+
+    /// All queued requests (pending + submitted), for `GET /signature-requests`.
+    pub fn signature_requests(&self) -> Vec<PendingSignatureRequest> {
+        self.pending_requests.clone()
+    }
+
+    /// Mark a request observed (signed + broadcast) with its `tx_hash`. Returns
+    /// `false` if no such id. Submitted entries stay (so a chain-lag re-emit
+    /// still dedups and can't double-broadcast).
+    pub fn mark_request_observed(&mut self, id: u64, tx_hash: String) -> bool {
+        if let Some(r) = self.pending_requests.iter_mut().find(|r| r.id == id) {
+            r.status = "submitted".to_string();
+            r.tx_hash = Some(tx_hash);
+            true
+        } else {
+            false
+        }
     }
 
     // ---- derived views (read by the HTTP handlers) ----
@@ -343,5 +434,97 @@ mod tests {
         s.set_last_error(Some("boom".into()));
         let json = serde_json::to_string(&s.health_at(0)).unwrap();
         assert!(json.contains("\"last_error\":\"boom\""), "json was: {json}");
+    }
+
+    #[test]
+    fn enqueue_assigns_ids_and_lists_requests() {
+        let mut s = AgentState::new();
+        let id0 = s.enqueue_signature_request(
+            "startExecution".into(),
+            "0x11".into(),
+            "0xaaaa".into(),
+            0,
+            40204,
+            "startExecution job 7".into(),
+            200,
+        );
+        let id1 = s.enqueue_signature_request(
+            "submitCommitment".into(),
+            "0x11".into(),
+            "0xbbbb".into(),
+            0,
+            40204,
+            "submitCommitment job 7".into(),
+            200,
+        );
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        let reqs = s.signature_requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].intent, "startExecution");
+        assert_eq!(reqs[0].status, "pending");
+        assert_eq!(reqs[0].value_wei, "0");
+    }
+
+    #[test]
+    fn enqueue_is_idempotent_by_calldata() {
+        let mut s = AgentState::new();
+        let a = s.enqueue_signature_request(
+            "startExecution".into(),
+            "0x11".into(),
+            "0xaaaa".into(),
+            0,
+            40204,
+            "ctx".into(),
+            200,
+        );
+        // Same calldata re-emitted next tick → same id, no duplicate entry.
+        let b = s.enqueue_signature_request(
+            "startExecution".into(),
+            "0x11".into(),
+            "0xaaaa".into(),
+            0,
+            40204,
+            "ctx".into(),
+            200,
+        );
+        assert_eq!(a, b);
+        assert_eq!(s.signature_requests().len(), 1);
+    }
+
+    #[test]
+    fn mark_observed_sets_status_and_tx_hash() {
+        let mut s = AgentState::new();
+        let id = s.enqueue_signature_request(
+            "completeJob".into(),
+            "0x11".into(),
+            "0xcccc".into(),
+            0,
+            40204,
+            "ctx".into(),
+            0,
+        );
+        assert!(s.mark_request_observed(id, "0xdeadbeef".into()));
+        let r = &s.signature_requests()[0];
+        assert_eq!(r.status, "submitted");
+        assert_eq!(r.tx_hash.as_deref(), Some("0xdeadbeef"));
+        // An observed entry still dedups a chain-lag re-emit (no double-broadcast).
+        let again = s.enqueue_signature_request(
+            "completeJob".into(),
+            "0x11".into(),
+            "0xcccc".into(),
+            0,
+            40204,
+            "ctx".into(),
+            0,
+        );
+        assert_eq!(again, id);
+        assert_eq!(s.signature_requests().len(), 1);
+    }
+
+    #[test]
+    fn mark_observed_unknown_id_is_false() {
+        let mut s = AgentState::new();
+        assert!(!s.mark_request_observed(99, "0x".into()));
     }
 }

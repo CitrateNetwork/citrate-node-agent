@@ -30,6 +30,7 @@ mod daemon;
 // directory, and the signing/broadcast *relay* — are the TD-27/TD-17 follow-ups.
 mod execution;
 mod live;
+mod relay;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -270,6 +271,10 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
             };
             let sender = live::UnsignedHeartbeatSender;
 
+            // The signing relay: unsigned writes are enqueued into the shared
+            // supervision state for gui-native to sign + broadcast + observe.
+            let signer = relay::RelaySigner::new(state.clone());
+
             // Earnings polling runs whenever RPC + provider are configured (a
             // provider earns from past jobs even when not currently executing).
             let accounting = abi::address_from_hex(chainio::contribution_accounting())?;
@@ -288,18 +293,19 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                     accounting,
                     me: provider,
                 },
-                signer: lifecycle::UnsignedJobSigner::new(),
+                signer: signer.clone(),
                 in_flight: tokio::sync::Mutex::new(false),
             };
 
             // SELL-S2 execution wiring: drive the configured job when the
             // execution backends are all configured; otherwise bid + earn only.
-            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id)? {
+            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id, signer)? {
                 Some(exec) => {
                     println!(
                         "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
-                         EXECUTION + earnings enabled (unsigned signer: emits requests for \
-                         gui-native to sign; the broadcast/observe relay is TD-17/27)"
+                         EXECUTION + earnings enabled; unsigned writes are queued to \
+                         GET /signature-requests for gui-native to sign + broadcast + observe \
+                         (POST /signature-requests/{{id}}/observed)"
                     );
                     daemon::run_loop(
                         state,
@@ -354,7 +360,7 @@ type LiveJobExecutor = execution::JobExecutor<
     live::FileInputSource,
     executor::IpfsGatewaySource,
     executor::LlamaServerInference,
-    lifecycle::UnsignedJobSigner,
+    relay::RelaySigner,
 >;
 
 /// Build the live job executor if the execution backends are configured, else
@@ -368,6 +374,7 @@ fn build_job_executor(
     me: chainio::abi::Address,
     job_id: u128,
     chain_id: u64,
+    signer: relay::RelaySigner,
 ) -> Result<Option<LiveJobExecutor>, Box<dyn std::error::Error>> {
     let (Some(gateway), Some(llama), Some(input_dir)) = (
         std::env::var("CITRATE_IPFS_GATEWAY").ok(),
@@ -391,13 +398,14 @@ fn build_job_executor(
             client: chainio::rpc::RpcClient::new(rpc_url.to_string()),
             marketplace,
             model_registry,
+            verifier: chainio::abi::address_from_hex(chainio::compute_verifier())?,
         },
         input: live::FileInputSource {
             dir: input_dir.into(),
         },
         weights: executor::IpfsGatewaySource::new(gateway),
         inference: executor::LlamaServerInference::new(llama),
-        signer: lifecycle::UnsignedJobSigner::new(),
+        signer,
         progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
     }))
 }

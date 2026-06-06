@@ -90,6 +90,7 @@ pub struct LiveJobView {
     pub client: RpcClient,
     pub marketplace: Address,
     pub model_registry: Address,
+    pub verifier: Address,
 }
 
 impl JobView for LiveJobView {
@@ -106,12 +107,18 @@ impl JobView for LiveJobView {
             .eth_block_number()
             .await
             .map_err(|e| format!("blockNumber: {e}"))?;
+        // Chain truth: has the commitment been recorded? Gates submitResult.
+        let committed =
+            chainio::verifier::live::commitment_submitted(&self.client, self.verifier, job_id)
+                .await
+                .map_err(|e| format!("getRecord: {e}"))?;
         Ok(ResolvedJob {
             job,
             ipfs_cid: model.ipfs_cid,
             is_active: model.is_active,
             expected_size: None,
             current_block,
+            committed,
         })
     }
 }
