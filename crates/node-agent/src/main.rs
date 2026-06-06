@@ -23,6 +23,14 @@
 mod bridge;
 mod clock;
 mod daemon;
+// SELL-S2 job-execution orchestration: complete + unit-tested (drives a won job
+// provision→infer→prove→submit→complete via the unsigned JobSigner seam). Its
+// run-loop call site — detecting "a job was assigned to me" (event scan), a live
+// `getJob`/`getModel` JobView, and the signing relay — is the TD-17 follow-up, so
+// the binary does not invoke it yet. `allow(dead_code)` marks that staged seam
+// (not a stub: the module is real and tested).
+#[allow(dead_code)]
+mod execution;
 mod live;
 
 use std::sync::Arc;
