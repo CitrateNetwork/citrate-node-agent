@@ -39,6 +39,9 @@ selector_fn!(get_provider, "getProvider(address)");
 selector_fn!(get_job, "getJob(uint256)");
 selector_fn!(get_provider_count, "getProviderCount()");
 
+// --- ModelRegistry (read) ---
+selector_fn!(get_model, "getModel(bytes32)");
+
 // --- ComputeMarketplace (write — calldata builders live in `marketplace`) ---
 selector_fn!(register_provider, "registerProvider(bytes32[])");
 selector_fn!(bid_on_job, "bidOnJob(uint256,uint256,uint256)");
@@ -70,6 +73,8 @@ mod tests {
         assert_eq!(hex4(get_provider()), "0x55f21eb7");
         assert_eq!(hex4(get_job()), "0xbf22c457");
         assert_eq!(hex4(get_provider_count()), "0x46ce4175");
+
+        assert_eq!(hex4(get_model()), "0x21e7c498");
 
         assert_eq!(hex4(register_provider()), "0x0589cd44");
         assert_eq!(hex4(bid_on_job()), "0x18360fc2");

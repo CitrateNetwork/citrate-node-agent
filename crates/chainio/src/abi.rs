@@ -30,6 +30,8 @@ pub enum AbiError {
     BadAddress,
     /// A hex string was malformed (bad prefix, odd length, non-hex digit).
     BadHex,
+    /// A dynamic `string` return field held invalid UTF-8.
+    BadString,
 }
 
 impl core::fmt::Display for AbiError {
@@ -42,6 +44,7 @@ impl core::fmt::Display for AbiError {
             AbiError::BadBool => write!(f, "bool word is neither 0 nor 1"),
             AbiError::BadAddress => write!(f, "address has dirty high bytes"),
             AbiError::BadHex => write!(f, "malformed hex"),
+            AbiError::BadString => write!(f, "string field is not valid UTF-8"),
         }
     }
 }

@@ -15,6 +15,7 @@
 pub mod abi;
 pub mod addrbook;
 pub mod marketplace;
+pub mod model_registry;
 pub mod rpc;
 pub mod selectors;
 
