@@ -270,20 +270,42 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
             };
             let sender = live::UnsignedHeartbeatSender;
 
+            // Earnings polling runs whenever RPC + provider are configured (a
+            // provider earns from past jobs even when not currently executing).
+            let accounting = abi::address_from_hex(chainio::contribution_accounting())?;
+            let claim_threshold_wei = std::env::var("CITRATE_CLAIM_THRESHOLD_WEI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1_000_000_000_000_000_000u128); // 1 SALT
+            let earnings = execution::EarningsPoller {
+                cfg: earnings::EarningsConfig {
+                    threshold_wei: claim_threshold_wei,
+                    accounting,
+                    chain_id,
+                },
+                view: live::LiveClaimableView {
+                    client: chainio::rpc::RpcClient::new(rpc_url.clone()),
+                    accounting,
+                    me: provider,
+                },
+                signer: lifecycle::UnsignedJobSigner::new(),
+                in_flight: tokio::sync::Mutex::new(false),
+            };
+
             // SELL-S2 execution wiring: drive the configured job when the
-            // execution backends are all configured; otherwise bid-only.
+            // execution backends are all configured; otherwise bid + earn only.
             match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id)? {
                 Some(exec) => {
                     println!(
                         "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
-                         EXECUTION enabled (unsigned signer: emits requests for gui-native to \
-                         sign; the broadcast/observe relay is TD-17/27)"
+                         EXECUTION + earnings enabled (unsigned signer: emits requests for \
+                         gui-native to sign; the broadcast/observe relay is TD-17/27)"
                     );
                     daemon::run_loop(
                         state,
                         &view,
                         &sender,
-                        &exec,
+                        &execution::Both(exec, earnings),
                         &bid_settings,
                         heartbeat::HEARTBEAT_INTERVAL,
                         None,
@@ -293,14 +315,14 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                 None => {
                     println!(
                         "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
-                         bid-only (set CITRATE_IPFS_GATEWAY + CITRATE_LLAMA_URL + \
-                         CITRATE_JOB_INPUT_DIR to execute won jobs)"
+                         bid + earnings (execution off; set CITRATE_IPFS_GATEWAY + \
+                         CITRATE_LLAMA_URL + CITRATE_JOB_INPUT_DIR to execute won jobs)"
                     );
                     daemon::run_loop(
                         state,
                         &view,
                         &sender,
-                        &execution::NoExecutor,
+                        &earnings,
                         &bid_settings,
                         heartbeat::HEARTBEAT_INTERVAL,
                         None,

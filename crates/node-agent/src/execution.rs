@@ -312,11 +312,74 @@ pub trait TickExecutor {
     fn tick(&self, state: &SharedState) -> impl std::future::Future<Output = ()> + Send;
 }
 
-/// No-op executor for the bid-only loop (no SELL-S2 job configured).
+/// No-op executor — the bid-only loop driver (used by the daemon tests and
+/// available to embedders that want bidding without execution/earnings). The
+/// live daemon always runs at least earnings, so the binary itself doesn't
+/// construct it.
+#[allow(dead_code)]
 pub struct NoExecutor;
 
 impl TickExecutor for NoExecutor {
     async fn tick(&self, _state: &SharedState) {}
+}
+
+/// Run two tick executors in sequence each tick (e.g. job execution + earnings).
+pub struct Both<A, B>(pub A, pub B);
+
+impl<A, B> TickExecutor for Both<A, B>
+where
+    A: TickExecutor + Sync,
+    B: TickExecutor + Sync,
+{
+    async fn tick(&self, state: &SharedState) {
+        self.0.tick(state).await;
+        self.1.tick(state).await;
+    }
+}
+
+/// Reads this provider's claimable balance (`ContributionAccounting.claimable(me)`).
+/// Live impl does the `eth_call`; tests fake it.
+pub trait ClaimableView {
+    fn claimable(&self) -> impl std::future::Future<Output = Result<u128, String>> + Send;
+}
+
+/// Polls claimable earnings and emits an unsigned `claimRewards()` when it crosses
+/// the threshold (WP-C). The `in_flight` guard makes it idempotent across ticks;
+/// it resets once the balance reads zero (the claim has cleared it).
+pub struct EarningsPoller<C, S> {
+    pub cfg: earnings::EarningsConfig,
+    pub view: C,
+    pub signer: S,
+    pub in_flight: tokio::sync::Mutex<bool>,
+}
+
+impl<C, S> TickExecutor for EarningsPoller<C, S>
+where
+    C: ClaimableView + Sync,
+    S: JobSigner + Sync,
+{
+    async fn tick(&self, state: &SharedState) {
+        let claimable = match self.view.claimable().await {
+            Ok(c) => c,
+            Err(e) => {
+                state.write().await.set_last_error(Some(format!("claimable: {e}")));
+                return;
+            }
+        };
+        let mut in_flight = self.in_flight.lock().await;
+        // A zero balance means any prior claim has cleared — reset the guard.
+        if claimable == 0 {
+            *in_flight = false;
+            return;
+        }
+        if let earnings::EarningsAction::Claim(req) =
+            earnings::plan_claim(claimable, *in_flight, &self.cfg)
+        {
+            if self.signer.request(req).await.is_ok() {
+                *in_flight = true;
+            }
+        }
+    }
 }
 
 impl<V, In, W, I, S> TickExecutor for JobExecutor<V, In, W, I, S>
@@ -628,5 +691,62 @@ mod tests {
         NoExecutor.tick(&state).await;
         // Nothing recorded — purely a no-op for the bid-only loop.
         assert_eq!(state.read().await.health_at(0).active_jobs, 0);
+    }
+
+    // ── EarningsPoller ──────────────────────────────────────────────────────
+
+    /// Serves a scripted sequence of claimable balances (one per tick).
+    struct FakeClaimable(std::sync::Mutex<std::collections::VecDeque<u128>>);
+    impl ClaimableView for FakeClaimable {
+        async fn claimable(&self) -> Result<u128, String> {
+            Ok(self.0.lock().unwrap().pop_front().unwrap_or(0))
+        }
+    }
+
+    fn poller(seq: Vec<u128>) -> EarningsPoller<FakeClaimable, UnsignedJobSigner> {
+        EarningsPoller {
+            cfg: earnings::EarningsConfig {
+                threshold_wei: 5 * 10u128.pow(18),
+                accounting: [0x1a; 20],
+                chain_id: 40204,
+            },
+            view: FakeClaimable(std::sync::Mutex::new(seq.into())),
+            signer: UnsignedJobSigner::new(),
+            in_flight: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn earnings_poller_holds_below_threshold() {
+        let state = shared();
+        let p = poller(vec![4 * 10u128.pow(18)]);
+        p.tick(&state).await;
+        assert!(p.signer.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn earnings_poller_claims_once_then_resets_on_zero() {
+        let state = shared();
+        // tick1: 6 SALT → claim; tick2: still 6 (in-flight) → hold; tick3: 0 → reset.
+        let p = poller(vec![6 * 10u128.pow(18), 6 * 10u128.pow(18), 0]);
+        p.tick(&state).await;
+        assert_eq!(p.signer.recorded().len(), 1);
+        assert_eq!(p.signer.recorded()[0].intent, WriteIntent::ClaimRewards);
+        assert!(*p.in_flight.lock().await);
+
+        p.tick(&state).await; // in-flight → no second claim
+        assert_eq!(p.signer.recorded().len(), 1);
+
+        p.tick(&state).await; // balance cleared → reset the guard
+        assert!(!*p.in_flight.lock().await);
+    }
+
+    #[tokio::test]
+    async fn both_runs_each_executor() {
+        let state = shared();
+        // Pair an earnings claim with a no-op; both should run.
+        let both = Both(poller(vec![6 * 10u128.pow(18)]), NoExecutor);
+        both.tick(&state).await;
+        assert_eq!(both.0.signer.recorded().len(), 1);
     }
 }

@@ -17,7 +17,7 @@ use heartbeat::{HeartbeatError, HeartbeatSender};
 
 use crate::bridge;
 use crate::daemon::{MarketSnapshot, MarketView};
-use crate::execution::{InputSource, JobView, ResolvedJob};
+use crate::execution::{ClaimableView, InputSource, JobView, ResolvedJob};
 
 /// Real chain reads for one provider + one target job id.
 pub struct LiveMarketView {
@@ -133,6 +133,21 @@ impl InputSource for FileInputSource {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("reading {}: {e}", path.display())),
         }
+    }
+}
+
+/// Real `ClaimableView`: reads `ContributionAccounting.claimable(me)`.
+pub struct LiveClaimableView {
+    pub client: RpcClient,
+    pub accounting: Address,
+    pub me: Address,
+}
+
+impl ClaimableView for LiveClaimableView {
+    async fn claimable(&self) -> Result<u128, String> {
+        chainio::accounting::live::claimable(&self.client, self.accounting, self.me)
+            .await
+            .map_err(|e| format!("claimable: {e}"))
     }
 }
 
