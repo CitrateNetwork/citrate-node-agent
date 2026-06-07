@@ -1,0 +1,17 @@
+[package]
+name = "lifecycle"
+version = "0.1.0"
+description = "Drives a won Citrate marketplace job through its on-chain state machine, emitting the next UNSIGNED write the agent must get signed (ADR-agent-signing: the daemon holds no keys)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure state-machine logic over chainio's decoded Job + calldata builders. The
+# signing seam (`JobSigner`) is async (a relay/gui-native surface implements it)
+# but the default `UnsignedJobSigner` just records requests — so the planner is
+# fully offline-testable. tokio is dev-only, for the async-signer test.
+[dependencies]
+chainio = { path = "../chainio" }
+
+[dev-dependencies]
+tokio = { workspace = true }

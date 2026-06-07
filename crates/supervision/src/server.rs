@@ -15,12 +15,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::state::AgentState;
@@ -57,6 +58,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/status", get(status))
         .route("/pause", post(pause))
         .route("/resume", post(resume))
+        .route("/signature-requests", get(list_signature_requests))
+        .route("/signature-requests/:id/observed", post(observe_signature_request))
         .with_state(state)
 }
 
@@ -82,6 +85,34 @@ async fn pause(State(state): State<SharedState>) -> impl IntoResponse {
 async fn resume(State(state): State<SharedState>) -> impl IntoResponse {
     state.write().await.resume();
     (StatusCode::OK, Json(state.read().await.lifecycle().as_str()))
+}
+
+/// `GET /signature-requests` → the unsigned chain writes the daemon needs signed.
+/// The signing surface (gui-native / relay) fetches these, signs + broadcasts the
+/// `pending` ones, and reports back via the observe endpoint.
+async fn list_signature_requests(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(state.read().await.signature_requests())
+}
+
+/// Body of `POST /signature-requests/{id}/observed`.
+#[derive(Deserialize)]
+struct ObserveBody {
+    /// The broadcast transaction hash.
+    tx_hash: String,
+}
+
+/// `POST /signature-requests/{id}/observed` → mark a request signed + broadcast.
+/// 200 on success; 404 if the id is unknown.
+async fn observe_signature_request(
+    State(state): State<SharedState>,
+    Path(id): Path<u64>,
+    Json(body): Json<ObserveBody>,
+) -> impl IntoResponse {
+    if state.write().await.mark_request_observed(id, body.tx_hash) {
+        (StatusCode::OK, Json("observed"))
+    } else {
+        (StatusCode::NOT_FOUND, Json("unknown request id"))
+    }
 }
 
 /// Bind the supervision server to `addr` (must be loopback) and serve until the
@@ -245,6 +276,59 @@ mod tests {
         assert!(v["heartbeat_age_secs"].is_number());
         // no error → field omitted.
         assert!(v.get("last_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn signature_requests_list_and_observe_roundtrip() {
+        let state = shared();
+        let id = {
+            let mut w = state.write().await;
+            w.enqueue_signature_request(
+                "startExecution".into(),
+                "0x11".into(),
+                "0xaaaa".into(),
+                0,
+                40204,
+                "startExecution job 7".into(),
+                200,
+            )
+        };
+        let addr = spawn(state.clone()).await;
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // GET → one pending request.
+        let v: serde_json::Value = client
+            .get(format!("{base}/signature-requests"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["intent"], "startExecution");
+        assert_eq!(v[0]["status"], "pending");
+        assert_eq!(v[0]["value_wei"], "0");
+
+        // POST observed → 200; status flips to submitted.
+        let r = client
+            .post(format!("{base}/signature-requests/{id}/observed"))
+            .json(&serde_json::json!({ "tx_hash": "0xdead" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(state.read().await.signature_requests()[0].status, "submitted");
+
+        // Unknown id → 404.
+        let r = client
+            .post(format!("{base}/signature-requests/999/observed"))
+            .json(&serde_json::json!({ "tx_hash": "0x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
     }
 
     #[tokio::test]

@@ -25,6 +25,8 @@ use bidder::{BidDecision, Caps, ComputePricingOracle, Job as BidJob, Settings};
 use heartbeat::{HeartbeatError, HeartbeatSender};
 use supervision::SharedState;
 
+use crate::execution::TickExecutor;
+
 /// One refreshed view of the market the loop needs to make a decision: the
 /// agent's provider stats, the target job, and the oracle reading.
 ///
@@ -134,19 +136,23 @@ pub async fn beat<S: HeartbeatSender>(
 
 /// Run the supervised loop until `max_ticks` ticks have run (`None` = forever).
 ///
-/// Each tick runs [`tick`] then [`beat`] (the heartbeat cadence is one beat per
-/// tick here; in production the tick interval *is* the heartbeat interval). The
-/// loop never returns on a heartbeat error — it records it and keeps going.
-pub async fn run_loop<V, S>(
+/// Each tick runs [`tick`] (bid), then the [`TickExecutor`] (drive a won job —
+/// `NoExecutor` for the bid-only loop), then [`beat`] (the heartbeat cadence is
+/// one beat per tick here; in production the tick interval *is* the heartbeat
+/// interval). The loop never returns on a heartbeat error — it records it and
+/// keeps going.
+pub async fn run_loop<V, S, E>(
     state: SharedState,
     view: &V,
     sender: &S,
+    executor: &E,
     settings: &Settings,
     interval: Duration,
     max_ticks: Option<u64>,
 ) where
     V: MarketView,
     S: HeartbeatSender,
+    E: TickExecutor,
 {
     let mut ticks: u64 = 0;
     loop {
@@ -156,6 +162,7 @@ pub async fn run_loop<V, S>(
             }
         }
         tick(&state, view, settings).await;
+        executor.tick(&state).await; // drive a won job (no-op in the bid-only loop)
         let _ = beat(&state, sender).await; // errors are recorded, never fatal
         ticks += 1;
         if let Some(max) = max_ticks {
@@ -343,6 +350,7 @@ mod tests {
             state.clone(),
             &view,
             &sender,
+            &crate::execution::NoExecutor,
             &on_settings(),
             heartbeat::HEARTBEAT_INTERVAL,
             Some(3),

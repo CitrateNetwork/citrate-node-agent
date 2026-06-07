@@ -1,0 +1,23 @@
+[package]
+name = "executor"
+version = "0.1.0"
+description = "Citrate node-agent job executor: verified IPFS-fetch model provisioning, the inference runtime seam, and the Commitment-tier proof builder (SELL-S2)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `proof` is pure (tiny-keccak only) and builds bytes that satisfy the on-chain
+# `ComputeVerifier._verifyCommitment` predicate exactly. `models` (CID fetch +
+# integrity + cache) and `runtime` (the Inference trait + llama-server adapter)
+# put network/inference behind traits so the unit tests run fully offline; the
+# live paths gate on CITRATE_* env. tokio is dev-only (the async-trait tests).
+[dependencies]
+chainio = { path = "../chainio" }
+lifecycle = { path = "../lifecycle" }
+tiny-keccak = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

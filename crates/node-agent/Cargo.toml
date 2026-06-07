@@ -15,6 +15,9 @@ chainio = { path = "../chainio" }
 config = { path = "../config" }
 bidder = { path = "../bidder" }
 heartbeat = { path = "../heartbeat" }
+lifecycle = { path = "../lifecycle" }
+executor = { path = "../executor" }
+earnings = { path = "../earnings" }
 supervision = { path = "../supervision" }
 tokio.workspace = true
 

@@ -30,6 +30,8 @@ pub enum AbiError {
     BadAddress,
     /// A hex string was malformed (bad prefix, odd length, non-hex digit).
     BadHex,
+    /// A dynamic `string` return field held invalid UTF-8.
+    BadString,
 }
 
 impl core::fmt::Display for AbiError {
@@ -42,6 +44,7 @@ impl core::fmt::Display for AbiError {
             AbiError::BadBool => write!(f, "bool word is neither 0 nor 1"),
             AbiError::BadAddress => write!(f, "address has dirty high bytes"),
             AbiError::BadHex => write!(f, "malformed hex"),
+            AbiError::BadString => write!(f, "string field is not valid UTF-8"),
         }
     }
 }
@@ -72,6 +75,22 @@ pub fn encode_call(selector: [u8; 4], args: &[Word]) -> Vec<u8> {
     out
 }
 
+/// Encode the *tail* of a dynamic `bytes` value: a 32-byte big-endian length
+/// word followed by the data right-padded with zeros to a 32-byte boundary.
+///
+/// The *head* offset word that points at this tail is written by the caller
+/// (it depends on how many other head words/tails precede it). This is the one
+/// piece of dynamic ABI encoding the agent needs — for `submitResult`'s two
+/// `bytes` arguments — so it lives here rather than pulling in a full codec.
+pub fn encode_bytes_tail(bytes: &[u8]) -> Vec<u8> {
+    let padded = bytes.len().div_ceil(32) * 32;
+    let mut out = Vec::with_capacity(32 + padded);
+    out.extend_from_slice(&word_from_u128(bytes.len() as u128));
+    out.extend_from_slice(bytes);
+    out.resize(32 + padded, 0);
+    out
+}
+
 /// A cursor over ABI return data, reading 32-byte words left to right.
 pub struct Decoder<'a> {
     data: &'a [u8],
@@ -89,7 +108,7 @@ impl<'a> Decoder<'a> {
         let end = self.offset + 32;
         if end > self.data.len() {
             return Err(AbiError::TooShort {
-                need: (end + 31) / 32,
+                need: end.div_ceil(32),
                 got: self.data.len() / 32,
             });
         }
@@ -269,6 +288,25 @@ mod tests {
         assert_eq!(call.len(), 4 + 32);
         assert_eq!(&call[0..4], &sel);
         assert_eq!(call[4 + 31], 7);
+    }
+
+    #[test]
+    fn encode_bytes_tail_lengths_and_padding() {
+        // Empty: just a zero length word.
+        assert_eq!(encode_bytes_tail(&[]), vec![0u8; 32]);
+        // 5 bytes → length word(=5) + 32-byte padded data block.
+        let t = encode_bytes_tail(b"hello");
+        assert_eq!(t.len(), 64);
+        assert_eq!(t[31], 5); // length
+        assert_eq!(&t[32..37], b"hello");
+        assert!(t[37..64].iter().all(|&b| b == 0)); // zero-padded tail
+        // Exactly 32 bytes → no extra padding word.
+        let t32 = encode_bytes_tail(&[0xab; 32]);
+        assert_eq!(t32.len(), 64);
+        assert_eq!(t32[31], 32);
+        assert_eq!(&t32[32..64], &[0xab; 32]);
+        // 33 bytes → padded to 64.
+        assert_eq!(encode_bytes_tail(&[0u8; 33]).len(), 32 + 64);
     }
 
     #[test]

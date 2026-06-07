@@ -23,7 +23,15 @@
 mod bridge;
 mod clock;
 mod daemon;
+// SELL-S2 job-execution orchestration: drives a won job
+// provision→infer→prove→submit→complete via the unsigned JobSigner seam. Wired
+// into the daemon loop below (`build_job_executor` → `run_loop`'s executor). The
+// remaining external pieces — the off-chain input transport beyond a watched
+// directory, and the signing/broadcast *relay* — are the TD-27/TD-17 follow-ups.
+mod execution;
 mod live;
+mod profiler;
+mod relay;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,12 +41,34 @@ use chainio::abi;
 use config::ComputeSettings;
 use tokio::sync::RwLock;
 
-/// Default per-job work estimate used until the executor's profiler lands (S2):
-/// 0.5 pflop-hours (×1e18) and a 5-minute typical execution time. These are the
-/// agent's own estimates, not chain data; they feed cost-plus pricing and the
-/// deadline-feasibility gate.
-const DEFAULT_PFLOP_HOURS_1E18: u128 = 500_000_000_000_000_000; // 0.5 ×1e18
+/// Fallback per-model execution-time estimate (seconds) before a model has been
+/// profiled from a real run (TD-10). Feeds the deadline-feasibility gate.
 const DEFAULT_EXEC_SECS: u64 = 300;
+/// Default node throughput (pflops ×1e18) used to derive pflop-hours from the
+/// measured/estimated execution time. 6 pflops × (300s/3600) = 0.5 pflop-hours,
+/// reproducing the old SELL-S1 default for an unprofiled node. Override with
+/// `CITRATE_NODE_PFLOPS_1E18`.
+const DEFAULT_NODE_PFLOPS_1E18: u128 = 6_000_000_000_000_000_000;
+/// Blocks to sample when deriving seconds-per-block from chain timestamps.
+const SECS_PER_BLOCK_SAMPLE: u128 = 20;
+
+/// Build the per-model profiler from config (the node's throughput).
+fn build_profiler() -> std::sync::Arc<profiler::ModelProfiler> {
+    let node_pflops = std::env::var("CITRATE_NODE_PFLOPS_1E18")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NODE_PFLOPS_1E18);
+    std::sync::Arc::new(profiler::ModelProfiler::new(node_pflops, DEFAULT_EXEC_SECS))
+}
+
+/// Derive seconds-per-block from chain timestamps, falling back to the default
+/// when it can't be sampled (idle devnet / too few blocks).
+async fn derive_secs_per_block(client: &chainio::rpc::RpcClient) -> u64 {
+    match client.secs_per_block(SECS_PER_BLOCK_SAMPLE).await {
+        Ok(Some(s)) => s,
+        _ => bridge::DEFAULT_SECS_PER_BLOCK,
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -169,12 +199,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         job.id, job.max_price_wei, job.tier, job.state, job.execution_deadline_block, current_block
     );
 
-    let bid_job = bridge::map_job(
-        &job,
-        current_block,
-        DEFAULT_PFLOP_HOURS_1E18,
-        DEFAULT_EXEC_SECS,
-    );
+    // Chain-derived block time + per-model estimate (defaults until profiled).
+    let secs_per_block = derive_secs_per_block(&client).await;
+    let (pflop_hours, exec_secs) = build_profiler().estimate(&job.model_hash);
+    let bid_job = bridge::map_job(&job, current_block, secs_per_block, pflop_hours, exec_secs);
 
     // 4. Decision.
     let decision = bidder::evaluate(&bid_job, &oracle, &bid_settings, &caps);
@@ -241,7 +269,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     let provider_addr = std::env::var("CITRATE_PROVIDER_ADDRESS").ok();
     match (rpc_url, provider_addr) {
         (Some(rpc_url), Some(provider_hex)) => {
-            let client = chainio::rpc::RpcClient::new(rpc_url);
+            let client = chainio::rpc::RpcClient::new(rpc_url.clone());
             let chain_id = client.eth_chain_id().await?;
             if chain_id != chainio::CHAIN_ID {
                 return Err(format!(
@@ -250,26 +278,92 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                 )
                 .into());
             }
+            let marketplace = abi::address_from_hex(chainio::compute_marketplace())?;
+            let model_registry = abi::address_from_hex(chainio::model_registry())?;
+            let provider = abi::address_from_hex(&provider_hex)?;
+
+            // TD-10: chain-derived block time + per-model profiler (shared between
+            // the bidder's market view and the executor that records real runs).
+            let secs_per_block = derive_secs_per_block(&client).await;
+            let profiler = build_profiler();
+            println!("node-agent daemon: block time {secs_per_block}s/block (chain-derived)");
+
             let view = live::LiveMarketView {
                 client,
-                marketplace: abi::address_from_hex(chainio::compute_marketplace())?,
+                marketplace,
                 oracle: abi::address_from_hex(chainio::compute_pricing_oracle())?,
-                provider: abi::address_from_hex(&provider_hex)?,
+                provider,
                 job_id,
-                estimated_pflop_hours_1e18: DEFAULT_PFLOP_HOURS_1E18,
-                estimated_exec_secs: DEFAULT_EXEC_SECS,
+                profiler: profiler.clone(),
+                secs_per_block,
             };
             let sender = live::UnsignedHeartbeatSender;
-            println!("node-agent daemon: live loop on chain {chain_id}, job #{job_id}");
-            daemon::run_loop(
-                state,
-                &view,
-                &sender,
-                &bid_settings,
-                heartbeat::HEARTBEAT_INTERVAL,
-                None,
-            )
-            .await;
+
+            // The signing relay: unsigned writes are enqueued into the shared
+            // supervision state for gui-native to sign + broadcast + observe.
+            let signer = relay::RelaySigner::new(state.clone());
+
+            // Earnings polling runs whenever RPC + provider are configured (a
+            // provider earns from past jobs even when not currently executing).
+            let accounting = abi::address_from_hex(chainio::contribution_accounting())?;
+            let claim_threshold_wei = std::env::var("CITRATE_CLAIM_THRESHOLD_WEI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1_000_000_000_000_000_000u128); // 1 SALT
+            let earnings = execution::EarningsPoller {
+                cfg: earnings::EarningsConfig {
+                    threshold_wei: claim_threshold_wei,
+                    accounting,
+                    chain_id,
+                },
+                view: live::LiveClaimableView {
+                    client: chainio::rpc::RpcClient::new(rpc_url.clone()),
+                    accounting,
+                    me: provider,
+                },
+                signer: signer.clone(),
+                in_flight: tokio::sync::Mutex::new(false),
+            };
+
+            // SELL-S2 execution wiring: drive the configured job when the
+            // execution backends are all configured; otherwise bid + earn only.
+            match build_job_executor(&rpc_url, marketplace, model_registry, provider, job_id, chain_id, signer, profiler.clone())? {
+                Some(exec) => {
+                    println!(
+                        "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
+                         EXECUTION + earnings enabled; unsigned writes are queued to \
+                         GET /signature-requests for gui-native to sign + broadcast + observe \
+                         (POST /signature-requests/{{id}}/observed)"
+                    );
+                    daemon::run_loop(
+                        state,
+                        &view,
+                        &sender,
+                        &execution::Both(exec, earnings),
+                        &bid_settings,
+                        heartbeat::HEARTBEAT_INTERVAL,
+                        None,
+                    )
+                    .await;
+                }
+                None => {
+                    println!(
+                        "node-agent daemon: live loop on chain {chain_id}, job #{job_id} — \
+                         bid + earnings (execution off; set CITRATE_IPFS_GATEWAY + \
+                         CITRATE_LLAMA_URL + CITRATE_JOB_INPUT_DIR to execute won jobs)"
+                    );
+                    daemon::run_loop(
+                        state,
+                        &view,
+                        &sender,
+                        &earnings,
+                        &bid_settings,
+                        heartbeat::HEARTBEAT_INTERVAL,
+                        None,
+                    )
+                    .await;
+                }
+            }
         }
         _ => {
             println!(
@@ -285,4 +379,64 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     }
 
     Ok(())
+}
+
+/// The concrete live SELL-S2 executor: live chain reads + watched-dir input +
+/// IPFS-gateway weights + resident llama-server inference + the unsigned signer.
+type LiveJobExecutor = execution::JobExecutor<
+    live::LiveJobView,
+    live::FileInputSource,
+    executor::IpfsGatewaySource,
+    executor::LlamaServerInference,
+    relay::RelaySigner,
+>;
+
+/// Build the live job executor if the execution backends are configured, else
+/// `None` (bid-only). Requires `CITRATE_IPFS_GATEWAY` (weights), `CITRATE_LLAMA_URL`
+/// (inference), and `CITRATE_JOB_INPUT_DIR` (the off-chain input drop); the model
+/// cache dir defaults but can be overridden with `CITRATE_MODEL_CACHE_DIR`.
+#[allow(clippy::too_many_arguments)] // distinct chain/exec params; bundling adds noise
+fn build_job_executor(
+    rpc_url: &str,
+    marketplace: chainio::abi::Address,
+    model_registry: chainio::abi::Address,
+    me: chainio::abi::Address,
+    job_id: u128,
+    chain_id: u64,
+    signer: relay::RelaySigner,
+    profiler: std::sync::Arc<profiler::ModelProfiler>,
+) -> Result<Option<LiveJobExecutor>, Box<dyn std::error::Error>> {
+    let (Some(gateway), Some(llama), Some(input_dir)) = (
+        std::env::var("CITRATE_IPFS_GATEWAY").ok(),
+        std::env::var("CITRATE_LLAMA_URL").ok(),
+        std::env::var("CITRATE_JOB_INPUT_DIR").ok(),
+    ) else {
+        return Ok(None);
+    };
+    let cache_dir = std::env::var("CITRATE_MODEL_CACHE_DIR")
+        .unwrap_or_else(|_| "/var/lib/citrate-node-agent/models".to_string());
+    let nonce = live::random_nonce()?;
+
+    Ok(Some(execution::JobExecutor {
+        job_id,
+        me,
+        marketplace,
+        chain_id,
+        cache_dir: cache_dir.into(),
+        nonce,
+        view: live::LiveJobView {
+            client: chainio::rpc::RpcClient::new(rpc_url.to_string()),
+            marketplace,
+            model_registry,
+            verifier: chainio::abi::address_from_hex(chainio::compute_verifier())?,
+        },
+        input: live::FileInputSource {
+            dir: input_dir.into(),
+        },
+        weights: executor::IpfsGatewaySource::new(gateway),
+        inference: executor::LlamaServerInference::new(llama),
+        signer,
+        profiler,
+        progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
+    }))
 }

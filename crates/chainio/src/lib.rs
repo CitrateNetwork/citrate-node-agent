@@ -13,10 +13,13 @@
 //!   calls SELL-S1 needs: `getProvider`, `getJob`, `saltPerPflopHour`.
 
 pub mod abi;
+pub mod accounting;
 pub mod addrbook;
 pub mod marketplace;
+pub mod model_registry;
 pub mod rpc;
 pub mod selectors;
+pub mod verifier;
 
 // Re-export the address-book surface at the crate root so existing callers and
 // the canonical-address tripwire keep their `chainio::compute_marketplace()`

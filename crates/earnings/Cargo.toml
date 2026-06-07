@@ -1,0 +1,14 @@
+[package]
+name = "earnings"
+version = "0.1.0"
+description = "SELL-S2 earnings sweep for the Citrate node agent: poll ContributionAccounting.claimable and emit an unsigned claimRewards request when it crosses a threshold."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure decision logic over a freshly-read claimable balance → reuses the
+# lifecycle signer seam (unsigned SignatureRequest). No I/O, no keys; the daemon
+# does the chain read + hands the request to the signing surface.
+[dependencies]
+chainio = { path = "../chainio" }
+lifecycle = { path = "../lifecycle" }

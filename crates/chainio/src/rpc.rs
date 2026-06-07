@@ -73,6 +73,24 @@ pub fn parse_result_string(resp: &Value) -> Result<String, RpcError> {
     }
 }
 
+/// Extract the raw `result` JSON value from a response, surfacing `error`.
+/// (Like [`parse_result_string`] but for methods whose result is an object,
+/// e.g. `eth_getBlockByNumber`.)
+pub fn parse_result_value(resp: &Value) -> Result<Value, RpcError> {
+    if let Some(err) = resp.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        return Err(RpcError::Rpc { code, message });
+    }
+    resp.get("result")
+        .cloned()
+        .ok_or_else(|| RpcError::MalformedResponse(resp.to_string()))
+}
+
 /// Build the `params` array for an `eth_call` to `to` with `data` (calldata
 /// bytes), at the `latest` block.
 pub fn eth_call_params(to: Address, data: &[u8]) -> Value {
@@ -147,6 +165,56 @@ impl RpcClient {
         Ok(self.quantity("eth_blockNumber").await? as u128)
     }
 
+    /// Low-level: send a method and return the raw `result` JSON value (for
+    /// object results like `eth_getBlockByNumber`).
+    pub async fn call_raw_value(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let req = build_request(self.next_id(), method, params);
+        let resp: Value = self
+            .http
+            .post(&self.url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(RpcError::Http)?
+            .json()
+            .await
+            .map_err(RpcError::Http)?;
+        parse_result_value(&resp)
+    }
+
+    /// `eth_getBlockByNumber(block, false).timestamp` → unix seconds.
+    pub async fn eth_block_timestamp(&self, block: u128) -> Result<u64, RpcError> {
+        let block_hex = format!("0x{block:x}");
+        let result = self
+            .call_raw_value("eth_getBlockByNumber", json!([block_hex, false]))
+            .await?;
+        let ts = result
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?;
+        parse_quantity(ts)
+    }
+
+    /// Derive average **seconds-per-block** by sampling the timestamp delta
+    /// between the latest block and `sample` blocks earlier. Returns `Ok(None)`
+    /// when there aren't enough blocks or the timestamps don't advance (e.g. an
+    /// idle single-producer devnet) — the caller falls back to a default.
+    pub async fn secs_per_block(&self, sample: u128) -> Result<Option<u64>, RpcError> {
+        if sample == 0 {
+            return Ok(None);
+        }
+        let head = self.eth_block_number().await?;
+        if head < sample {
+            return Ok(None);
+        }
+        let t_head = self.eth_block_timestamp(head).await?;
+        let t_prev = self.eth_block_timestamp(head - sample).await?;
+        if t_head <= t_prev {
+            return Ok(None);
+        }
+        Ok(Some(((t_head - t_prev) / sample as u64).max(1)))
+    }
+
     /// Call a no-arg JSON-RPC method that returns a hex QUANTITY, parsed as u64.
     async fn quantity(&self, method: &str) -> Result<u64, RpcError> {
         let result = self.call_raw(method, json!([])).await?;
@@ -182,6 +250,24 @@ mod tests {
     fn parse_result_extracts_string() {
         let resp = json!({"jsonrpc":"2.0","id":1,"result":"0xabcd"});
         assert_eq!(parse_result_string(&resp).unwrap(), "0xabcd");
+    }
+
+    #[test]
+    fn parse_result_value_extracts_object_and_timestamp() {
+        // Mirrors an eth_getBlockByNumber result; timestamp is a hex quantity.
+        let resp = json!({"jsonrpc":"2.0","id":1,"result":{"number":"0x10","timestamp":"0x64"}});
+        let v = parse_result_value(&resp).unwrap();
+        let ts = parse_quantity(v.get("timestamp").unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(ts, 100); // 0x64
+    }
+
+    #[test]
+    fn parse_result_value_surfaces_rpc_error() {
+        let resp = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}});
+        assert!(matches!(
+            parse_result_value(&resp),
+            Err(RpcError::Rpc { code: -32000, .. })
+        ));
     }
 
     #[test]
