@@ -1,61 +1,67 @@
 //! `addrbook` — canonical chain-40204 address book for the Citrate node agent.
 //!
-//! This module **MIRRORS** the canonical `citrate-chain`
-//! `contracts/DEPLOYED_ADDRESSES.md` table (chain id `40204`, testnet-beta).
-//! It is hand-mirrored on purpose so the node agent has a zero-dependency,
-//! compile-time-checked source of contract addresses for the compute-critical
-//! contracts it drives (marketplace, pool, verifier, heartbeat, oracle,
-//! accounting, gateway, registry, wrapped SALT, inference router).
+//! Reads from the federation-canonical contract-address table vendored at
+//! `src/generated/addresses.json` (source-of-truth:
+//! `citrate-chain/contracts/addresses/40204.json`). After a chain re-roll +
+//! post-redeploy ceremony, run `bash scripts/sync-addresses.sh` from the
+//! node-agent repo root to re-vendor the table — no inline edit required.
 //!
-//! Because this is a mirror, it can drift from the canonical table when chain
-//! contracts are re-deployed or re-rolled. The `canonical_addresses` test in
-//! this crate is the **divergence tripwire** (federation Rule 11): if anyone
-//! changes a constant here without it matching the canonical table, the pinning
-//! tests fail. To update after a chain re-roll, re-mirror from
-//! `citrate-chain/contracts/DEPLOYED_ADDRESSES.md` and update the tests in the
-//! same change. This is a documented design, not a TODO.
+//! Pre-WP-Z this module hand-mirrored the addresses as `&[(&str, &str)]`
+//! constants and relied on a per-constant tripwire test to catch divergence.
+//! That class of drift is now eliminated: the typed helpers read from the
+//! same canonical the federation reads from.
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Chain id this address book is valid for.
 pub const CHAIN_ID: u64 = 40204;
 
-/// Canonical chain-40204 addresses for the compute-critical contracts the node
-/// agent drives. Mirrored from `citrate-chain` `DEPLOYED_ADDRESSES.md`.
-///
-/// `(canonical_name, address)`. Names match the contract names in the canonical
-/// table so the tripwire test reads 1:1 against it.
-const ADDRESS_BOOK: &[(&str, &str)] = &[
-    ("ComputeMarketplace", "0xf3f9f72ea2bb3f763b07390b7257da643b8ee9b6"),
-    ("ComputePool", "0x8b36c15552394ce44173a29d054dc5ca482e65d3"),
-    ("ComputeVerifier", "0x86d918808b48ad543c9c816b5303b7dbcb0e321f"),
-    ("HeartbeatMonitor", "0x46773aeca885be65cd313b7d9bce9625767d40b5"),
-    ("ComputePricingOracle", "0xa1eed6ae021504e2a1e310e6c0f7c1a0c5bf4647"),
-    ("ContributionAccounting", "0x1afe987622ab5add275d2fd21248f77f5e00667f"),
-    ("BulkComputeGateway", "0x7efc1eb17beff413e1af7fb3bb541e895c307300"),
-    ("ModelRegistry", "0x077fbc3338a9e6bad90a3a041e6b7425689754ef"),
-    ("WrappedSALT", "0x1f73bb479f397a34b5e3145e51d25bc5007273bf"),
-    ("InferenceRouter", "0xad7c3135c1b9b3189208fd617b6b058c1c0469f3"),
-];
+/// Vendored copy of the federation-canonical contract-address table.
+const ADDRESS_TABLE_JSON: &str = include_str!("generated/addresses.json");
 
-/// Look up a contract address by its canonical name (as spelled in
-/// `DEPLOYED_ADDRESSES.md`). Returns `None` for unknown / non-mirrored names.
+/// Subset of the canonical table the node agent reads.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalTable {
+    contracts: HashMap<String, String>,
+    aa_stack: HashMap<String, String>,
+}
+
+/// Flat name → address map combining `contracts` + `aaStack`. Owned strings
+/// are leaked into 'static memory at parse time so the public API can return
+/// `&'static str` — the leak is sound because this map lives for the program
+/// lifetime anyway.
+static ADDRESS_BOOK: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    let table: CanonicalTable = serde_json::from_str(ADDRESS_TABLE_JSON)
+        .expect("src/generated/addresses.json is malformed at build time");
+    let mut book = HashMap::with_capacity(table.contracts.len() + table.aa_stack.len());
+    for (name, addr) in table.contracts.into_iter().chain(table.aa_stack.into_iter()) {
+        let name_static: &'static str = Box::leak(name.into_boxed_str());
+        let addr_static: &'static str = Box::leak(addr.into_boxed_str());
+        book.insert(name_static, addr_static);
+    }
+    book
+});
+
+/// Look up a contract address by its canonical name (the Solidity contract
+/// name, e.g. `"ComputeMarketplace"`). Returns `None` for unknown names.
 pub fn address_for(name: &str) -> Option<&'static str> {
-    ADDRESS_BOOK
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, addr)| *addr)
+    ADDRESS_BOOK.get(name).copied()
 }
 
 macro_rules! typed_helper {
     ($fn_name:ident, $canonical:literal, $doc:literal) => {
         #[doc = $doc]
         pub fn $fn_name() -> &'static str {
-            // Safe: the canonical name is present in ADDRESS_BOOK by
-            // construction, and the `canonical_addresses` test pins it.
-            address_for($canonical).expect(concat!(
-                "missing canonical address for ",
-                $canonical,
-                " in ADDRESS_BOOK"
-            ))
+            address_for($canonical).unwrap_or_else(|| {
+                panic!(
+                    "canonical address table missing {:?} (vendored \
+                     src/generated/addresses.json may be stale — run \
+                     `bash scripts/sync-addresses.sh`)",
+                    $canonical
+                )
+            })
         }
     };
 }
@@ -115,60 +121,48 @@ typed_helper!(
 mod tests {
     use super::*;
 
-    /// Divergence tripwire (Rule 11): pin EVERY compute-critical address to its
-    /// canonical chain-40204 value from `citrate-chain` `DEPLOYED_ADDRESSES.md`.
-    /// If a chain re-roll changes an address, re-mirror the book AND this test
-    /// in the same change.
+    /// Sanity check: every typed helper resolves to a 20-byte hex address
+    /// that comes from the vendored canonical. The exact addresses are
+    /// asserted in the canonical's own tests + the explorer's PR2 test
+    /// suite; here we just verify the shape so a malformed vendored copy
+    /// is caught at this crate's test gate.
     #[test]
-    fn canonical_addresses() {
+    fn typed_helpers_resolve_to_shape_correct_addresses() {
         assert_eq!(CHAIN_ID, 40204);
 
-        assert_eq!(
-            compute_marketplace(),
-            "0xf3f9f72ea2bb3f763b07390b7257da643b8ee9b6"
-        );
-        assert_eq!(compute_pool(), "0x8b36c15552394ce44173a29d054dc5ca482e65d3");
-        assert_eq!(
-            compute_verifier(),
-            "0x86d918808b48ad543c9c816b5303b7dbcb0e321f"
-        );
-        assert_eq!(
-            heartbeat_monitor(),
-            "0x46773aeca885be65cd313b7d9bce9625767d40b5"
-        );
-        assert_eq!(
-            compute_pricing_oracle(),
-            "0xa1eed6ae021504e2a1e310e6c0f7c1a0c5bf4647"
-        );
-        assert_eq!(
-            contribution_accounting(),
-            "0x1afe987622ab5add275d2fd21248f77f5e00667f"
-        );
-        assert_eq!(
-            bulk_compute_gateway(),
-            "0x7efc1eb17beff413e1af7fb3bb541e895c307300"
-        );
-        assert_eq!(
-            model_registry(),
-            "0x077fbc3338a9e6bad90a3a041e6b7425689754ef"
-        );
-        assert_eq!(wrapped_salt(), "0x1f73bb479f397a34b5e3145e51d25bc5007273bf");
-        assert_eq!(
-            inference_router(),
-            "0xad7c3135c1b9b3189208fd617b6b058c1c0469f3"
-        );
+        let addresses = [
+            ("compute_marketplace", compute_marketplace()),
+            ("compute_pool", compute_pool()),
+            ("compute_verifier", compute_verifier()),
+            ("heartbeat_monitor", heartbeat_monitor()),
+            ("compute_pricing_oracle", compute_pricing_oracle()),
+            ("contribution_accounting", contribution_accounting()),
+            ("bulk_compute_gateway", bulk_compute_gateway()),
+            ("model_registry", model_registry()),
+            ("wrapped_salt", wrapped_salt()),
+            ("inference_router", inference_router()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (label, addr) in addresses {
+            assert!(
+                addr.starts_with("0x") && addr.len() == 42,
+                "{label} is not a 20-byte hex: {addr}"
+            );
+            assert!(
+                seen.insert(addr.to_lowercase()),
+                "{label} address collides with another helper: {addr}"
+            );
+        }
     }
 
     /// `address_for` resolves canonical names and rejects unknown ones.
     #[test]
     fn address_for_lookup() {
-        assert_eq!(
-            address_for("ComputeMarketplace"),
-            Some("0xf3f9f72ea2bb3f763b07390b7257da643b8ee9b6")
-        );
+        assert_eq!(address_for("ComputeMarketplace"), Some(compute_marketplace()));
         assert_eq!(address_for("NotAContract"), None);
-        // Helper and map agree.
         assert_eq!(address_for("HeartbeatMonitor"), Some(heartbeat_monitor()));
+        // EW-S1 AA stack also reachable via address_for.
+        assert!(address_for("EntryPoint").is_some());
     }
 
     /// Defect D1 regression: the stale gui-native ComputeMarketplace address
@@ -177,22 +171,34 @@ mod tests {
     fn stale_gui_native_address_absent() {
         const STALE: &str = "0x8951ae72e5479cae28ef7bb3caa4207d5719e24b";
         assert!(
-            ADDRESS_BOOK.iter().all(|(_, addr)| *addr != STALE),
+            ADDRESS_BOOK.values().all(|addr| *addr != STALE),
             "stale gui-native address {STALE} leaked into the canonical book"
         );
         assert_eq!(address_for(STALE), None);
     }
 
-    /// No duplicate names in the book (a copy-paste guard for the mirror).
+    /// The vendored canonical includes every contract the typed helpers
+    /// ask for — a missing name would surface as a panic at boot, not at
+    /// test time. This test enumerates the helper inputs to make that
+    /// guarantee explicit.
     #[test]
-    fn no_duplicate_names() {
-        for i in 0..ADDRESS_BOOK.len() {
-            for j in (i + 1)..ADDRESS_BOOK.len() {
-                assert_ne!(
-                    ADDRESS_BOOK[i].0, ADDRESS_BOOK[j].0,
-                    "duplicate contract name in ADDRESS_BOOK"
-                );
-            }
+    fn canonical_has_every_typed_helper_name() {
+        for name in [
+            "ComputeMarketplace",
+            "ComputePool",
+            "ComputeVerifier",
+            "HeartbeatMonitor",
+            "ComputePricingOracle",
+            "ContributionAccounting",
+            "BulkComputeGateway",
+            "ModelRegistry",
+            "WrappedSALT",
+            "InferenceRouter",
+        ] {
+            assert!(
+                ADDRESS_BOOK.contains_key(name),
+                "vendored src/generated/addresses.json is missing {name:?} — run `bash scripts/sync-addresses.sh`"
+            );
         }
     }
 }
