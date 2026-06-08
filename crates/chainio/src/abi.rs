@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn address_from_hex_parses_canonical() {
-        let a = address_from_hex("0xf3f9f72ea2bb3f763b07390b7257da643b8ee9b6").unwrap();
+        let a = address_from_hex("0xc12dbcdb80ef2ae675315f455210f39a736a373c").unwrap();
         assert_eq!(a[0], 0xf3);
         assert_eq!(a[19], 0xb6);
         assert_eq!(
