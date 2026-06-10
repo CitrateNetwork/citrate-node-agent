@@ -10,6 +10,18 @@
 //! the handlers observe the same record. [`router`] is exposed separately from
 //! [`serve`] so tests can mount it on an ephemeral port without committing to a
 //! fixed address.
+//!
+//! ## SECREM-01 SVC-6 (pre-audit 2026-06-09): localhost-trust assumption
+//!
+//! This is an unauthenticated control surface — `/pause`, `/resume`, and the
+//! signature-request endpoints mutate agent state and have NO per-request auth.
+//! Its only access control is the loopback bind: any process able to reach
+//! `127.0.0.1:19600` is trusted, on the assumption that it shares the node
+//! operator's trust boundary (the local GUI / signing relay). That assumption
+//! is enforced fail-closed in two places — [`resolve_addr`] and [`serve`] both
+//! reject any non-loopback bind, so the env override cannot widen this surface
+//! to `0.0.0.0` or a routable interface. If per-request auth is ever needed
+//! (e.g. multi-tenant hosts), add it here; do NOT relax the loopback guard.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

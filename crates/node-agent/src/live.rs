@@ -86,13 +86,19 @@ impl MarketView for LiveMarketView {
 /// Real `JobView`: resolves a job id via `getJob` + `getModel` + `eth_blockNumber`.
 ///
 /// `expected_size` is `None` — `ModelRegistry.getModel` does not return
-/// `sizeBytes` (TD-26), so provisioning falls back to CID-addressed-transport
-/// integrity; supply a size only if a richer read is wired later.
+/// `sizeBytes` (TD-26); supply a size only if a richer read is wired later.
+///
+/// SECREM-01 SVC-2 (pre-audit 2026-06-09): `weights_sha256` is the operator's
+/// trusted digest of the model weights (`CITRATE_MODEL_SHA256`); the registry
+/// does not expose one (TD). When `None`, provisioning only succeeds for
+/// self-verifying CIDv1 raw sha2-256 CIDs and otherwise fails closed — the
+/// gateway is never trusted for integrity.
 pub struct LiveJobView {
     pub client: RpcClient,
     pub marketplace: Address,
     pub model_registry: Address,
     pub verifier: Address,
+    pub weights_sha256: Option<[u8; 32]>,
 }
 
 impl JobView for LiveJobView {
@@ -119,6 +125,7 @@ impl JobView for LiveJobView {
             ipfs_cid: model.ipfs_cid,
             is_active: model.is_active,
             expected_size: None,
+            expected_sha256: self.weights_sha256, // SECREM-01 SVC-2
             current_block,
             committed,
         })

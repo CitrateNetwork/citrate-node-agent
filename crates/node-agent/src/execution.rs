@@ -65,6 +65,11 @@ pub struct JobContext {
     pub is_active: bool,
     /// The model size for the integrity cross-check, if known.
     pub expected_size: Option<u64>,
+    /// SECREM-01 SVC-2 (pre-audit 2026-06-09): trusted sha-256 of the weights
+    /// (registry/config), verified by local recomputation after download. When
+    /// `None`, provisioning requires a self-verifying CIDv1 raw sha2-256 CID
+    /// and otherwise fails closed.
+    pub expected_sha256: Option<[u8; 32]>,
     /// The job input to run inference on.
     pub input: Vec<u8>,
     /// Where to cache provisioned weights.
@@ -126,11 +131,22 @@ where
     match action {
         LifecycleAction::RunInference => {
             state.write().await.set_active_jobs(1);
+            // SECREM-01 SVC-7 (pre-audit 2026-06-09): the CID comes from chain
+            // (ModelRegistry.getModel) and is interpolated into an IPFS gateway
+            // URL (`{gateway}/ipfs/{cid}`) deep inside the executor. Validate it
+            // against the CID charset/length here, BEFORE it can reach that
+            // interpolation, so a malicious registry entry can't smuggle URL
+            // control characters (path/query/fragment/host) into the gateway
+            // request and pivot it into SSRF or a different endpoint.
+            if let Err(e) = validate_cid(&ctx.ipfs_cid) {
+                return record_error(state, format!("provision: {e}")).await;
+            }
             let model = match provision(
                 ctx.job.model_hash,
                 &ctx.ipfs_cid,
                 ctx.is_active,
                 ctx.expected_size,
+                ctx.expected_sha256, // SECREM-01 SVC-2: local recomputation gate
                 &ctx.cache_dir,
                 weights,
             )
@@ -188,6 +204,52 @@ async fn record_error(state: &SharedState, msg: String) -> StepOutcome {
     StepOutcome::Error(msg)
 }
 
+/// SECREM-01 SVC-7 (pre-audit 2026-06-09): fail-closed validation of an
+/// on-chain IPFS CID before it is interpolated into a gateway URL.
+///
+/// The CID is attacker-influenced (anyone who can register a model controls
+/// the `ipfsCID` string). It later becomes `{gateway}/ipfs/{cid}` in the
+/// executor's `IpfsGatewaySource::fetch`, so any URL-control character would
+/// let a crafted CID rewrite the request path, append a query/fragment, or
+/// (via `@`) repoint the host — i.e. SSRF / request smuggling against the
+/// node's local gateway.
+///
+/// We accept only the CIDv0 (`Qm…`, base58btc) and CIDv1 (`b…`, base32 lower)
+/// shapes the registry is expected to emit: ASCII-alphanumeric, length-bounded,
+/// and free of `/ ? # @` or whitespace. This is intentionally conservative —
+/// rejecting an exotic-but-valid CID is far cheaper than admitting an injection.
+fn validate_cid(cid: &str) -> Result<(), String> {
+    // Length bounds: CIDv0 is exactly 46 chars; multibase CIDv1 strings run
+    // longer but stay well under this ceiling for the codecs we serve.
+    const MIN_LEN: usize = 46;
+    const MAX_LEN: usize = 256;
+    if cid.len() < MIN_LEN || cid.len() > MAX_LEN {
+        return Err(format!(
+            "SECURITY [SVC-7]: rejecting model CID with out-of-range length {} (allowed {MIN_LEN}..={MAX_LEN})",
+            cid.len()
+        ));
+    }
+    // Charset: ASCII base58btc/base32 alphanumerics only. This rejects every
+    // URL-control character (`/ ? # @`), whitespace, and any non-ASCII byte.
+    if !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "SECURITY [SVC-7]: rejecting model CID {cid:?}: contains non-CID characters (only base58/base32 alphanumerics allowed)"
+        ));
+    }
+    // Multibase prefix sanity: CIDv0 starts `Qm`, CIDv1 starts with a known
+    // multibase code (base32 = `b`, base58btc = `z`). Anything else is not a
+    // CID we know how to serve.
+    let first = cid.as_bytes()[0];
+    let v0 = cid.starts_with("Qm");
+    let v1 = matches!(first, b'b' | b'B' | b'z' | b'f' | b'F');
+    if !(v0 || v1) {
+        return Err(format!(
+            "SECURITY [SVC-7]: rejecting model CID {cid:?}: unrecognized multibase/version prefix"
+        ));
+    }
+    Ok(())
+}
+
 // ── live-loop integration ───────────────────────────────────────────────────
 
 /// A job resolved from chain reads (everything the executor needs except the
@@ -199,6 +261,9 @@ pub struct ResolvedJob {
     pub ipfs_cid: String,
     pub is_active: bool,
     pub expected_size: Option<u64>,
+    /// SECREM-01 SVC-2: trusted weights sha-256 when a richer registry/config
+    /// read supplies it (see [`JobContext::expected_sha256`]).
+    pub expected_sha256: Option<[u8; 32]>,
     pub current_block: u128,
     /// Whether the commitment has been recorded on-chain (ComputeVerifier
     /// `commitmentSubmitted`) — chain truth that gates `submitResult`.
@@ -303,6 +368,7 @@ where
             ipfs_cid: resolved.ipfs_cid,
             is_active: resolved.is_active,
             expected_size: resolved.expected_size,
+            expected_sha256: resolved.expected_sha256,
             input,
             cache_dir: self.cache_dir.clone(),
         };
@@ -462,9 +528,13 @@ mod tests {
             marketplace: MARKETPLACE,
             chain_id: 40204,
             me: ME,
-            ipfs_cid: "bafycid".into(),
+            // SECREM-01 SVC-7: a real-shaped CIDv1 (base32) so it clears the
+            // pre-provision validate_cid guard; the Weights fake ignores it.
+            ipfs_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".into(),
             is_active: true,
             expected_size: Some(7),
+            // SECREM-01 SVC-2: provisioning now requires a local commitment.
+            expected_sha256: Some(executor::sha256_digest(b"weights")),
             input: b"the prompt".to_vec(),
             cache_dir: dir,
         }
@@ -620,9 +690,12 @@ mod tests {
         j.assigned_provider = assigned;
         ResolvedJob {
             job: j,
-            ipfs_cid: "bafycid".into(),
+            // SECREM-01 SVC-7: real-shaped CIDv1 so the validate_cid guard passes.
+            ipfs_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".into(),
             is_active: true,
             expected_size: Some(7),
+            // SECREM-01 SVC-2: provisioning now requires a local commitment.
+            expected_sha256: Some(executor::sha256_digest(b"weights")),
             current_block: 200,
             committed,
         }
@@ -810,5 +883,44 @@ mod tests {
         let both = Both(poller(vec![6 * 10u128.pow(18)]), NoExecutor);
         both.tick(&state).await;
         assert_eq!(both.0.signer.recorded().len(), 1);
+    }
+
+    // ── SECREM-01 SVC-7: CID validation before gateway-URL interpolation ──────
+
+    #[test]
+    fn validate_cid_accepts_real_cids() {
+        // CIDv1 base32 (lower) and CIDv0 base58btc.
+        assert!(validate_cid("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi").is_ok());
+        assert!(validate_cid("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG").is_ok());
+    }
+
+    #[test]
+    fn validate_cid_rejects_url_control_chars() {
+        // Each of these would let a chain-supplied CID rewrite the gateway URL.
+        let base = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        for injected in [
+            format!("{base}/../../etc/passwd"),
+            format!("{base}?redirect=1"),
+            format!("{base}#frag"),
+            format!("evil.example.com/@{base}"),
+            format!("{base} "),
+            format!("{base}\n"),
+            format!("http://attacker/{base}"),
+        ] {
+            assert!(
+                validate_cid(&injected).is_err(),
+                "expected rejection for {injected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_cid_rejects_short_and_unprefixed() {
+        assert!(validate_cid("bafycid").is_err()); // too short
+        assert!(validate_cid("").is_err()); // empty
+        // Right length + charset but no known multibase/version prefix.
+        assert!(validate_cid(&"x".repeat(50)).is_err());
+        // Over the length ceiling.
+        assert!(validate_cid(&format!("b{}", "a".repeat(300))).is_err());
     }
 }

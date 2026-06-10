@@ -15,6 +15,9 @@ pub mod proof;
 pub mod runtime;
 
 pub use lifecycle::CommitmentArtifacts;
-pub use models::{provision, Integrity, IpfsGatewaySource, ProvisionError, ProvisionedModel, WeightSource};
+pub use models::{
+    provision, sha256_digest, Integrity, IpfsGatewaySource, ProvisionError, ProvisionedModel,
+    WeightSource,
+};
 pub use proof::{CommitmentProver, ProofMaker};
 pub use runtime::{Inference, InferenceError, InferenceOutput, LlamaServerInference};

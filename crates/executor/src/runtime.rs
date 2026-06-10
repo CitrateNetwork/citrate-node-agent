@@ -124,7 +124,7 @@ mod tests {
                 model_hash: [0x01; 32],
                 path: path.clone(),
                 bytes_len: 7,
-                integrity: Integrity::CidTransportOnly,
+                integrity: Integrity::Sha256Verified,
             },
             path,
         )
@@ -163,7 +163,7 @@ mod tests {
             model_hash: [0x09; 32],
             path: PathBuf::from("/nonexistent/citrate/model.bin"),
             bytes_len: 0,
-            integrity: Integrity::CidTransportOnly,
+            integrity: Integrity::Sha256Verified,
         };
         let engine = LlamaServerInference::new("http://127.0.0.1:1"); // unused — file check first
         let err = engine.run(&model, b"x").await.unwrap_err();
