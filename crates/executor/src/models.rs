@@ -301,18 +301,31 @@ pub async fn provision<S: WeightSource + Sync>(
 /// SECREM-01 SVC-2: the gateway is treated as an untrusted transport — the
 /// bytes it returns are verified by [`provision`]'s local sha-256 recomputation,
 /// never by trusting the gateway's CID↔content binding.
+/// Default hard ceiling on a single weight fetch (8 GiB). Overridable via
+/// `CITRATE_MAX_WEIGHT_BYTES`. FUA-NODE-AGENT-04: bounds the body read so a
+/// malicious/compromised gateway can't OOM (or disk-fill) the daemon with a
+/// multi-GB response *before* the size/digest check runs.
+pub const DEFAULT_MAX_WEIGHT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 pub struct IpfsGatewaySource {
     gateway: String,
     client: reqwest::Client,
+    max_bytes: u64,
 }
 
 impl IpfsGatewaySource {
     /// `gateway` is the base URL, e.g. `http://127.0.0.1:8080` (a local Kubo
     /// node). Even a local node is verified-after-download (SVC-2).
     pub fn new(gateway: impl Into<String>) -> Self {
+        let max_bytes = std::env::var("CITRATE_MAX_WEIGHT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_WEIGHT_BYTES);
         Self {
             gateway: gateway.into(),
             client: reqwest::Client::new(),
+            max_bytes,
         }
     }
 }
@@ -320,7 +333,7 @@ impl IpfsGatewaySource {
 impl WeightSource for IpfsGatewaySource {
     async fn fetch(&self, cid: &str) -> Result<Vec<u8>, ProvisionError> {
         let url = format!("{}/ipfs/{}", self.gateway.trim_end_matches('/'), cid);
-        let resp = self
+        let mut resp = self
             .client
             .get(&url)
             .send()
@@ -329,11 +342,31 @@ impl WeightSource for IpfsGatewaySource {
         if !resp.status().is_success() {
             return Err(ProvisionError::Fetch(format!("gateway status {}", resp.status())));
         }
-        let bytes = resp
-            .bytes()
+        // FUA-NODE-AGENT-04: reject early on an oversized Content-Length, then
+        // stream with a running cap so an unbounded/chunked body can't OOM us.
+        if let Some(len) = resp.content_length() {
+            if len > self.max_bytes {
+                return Err(ProvisionError::Fetch(format!(
+                    "weight too large: Content-Length {len} > {} cap",
+                    self.max_bytes
+                )));
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| ProvisionError::Fetch(e.to_string()))?;
-        Ok(bytes.to_vec())
+            .map_err(|e| ProvisionError::Fetch(e.to_string()))?
+        {
+            if buf.len() as u64 + chunk.len() as u64 > self.max_bytes {
+                return Err(ProvisionError::Fetch(format!(
+                    "weight exceeds {} byte cap",
+                    self.max_bytes
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 }
 
