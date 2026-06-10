@@ -4,25 +4,32 @@
 //! and `isActive`), bring the weights onto local disk, integrity-check them, and
 //! cache them so a repeat job for the same model short-circuits the download.
 //!
-//! ## Honest integrity model
-//! A provider needs the *right* weights *present right now* to run one job — a
-//! fetch + integrity check, not a storage-market proof (that durable, rewarded
-//! path is PIN's sealed-PoRep). What we can guarantee today, with the reads the
-//! chain actually exposes and no new crypto deps:
+//! ## Integrity model — SECREM-01 SVC-2 (pre-audit 2026-06-09)
+//! Integrity must come from **local recomputation, never from the transport**.
+//! The pre-audit found that trusting the gateway's CID↔content binding lets a
+//! compromised or MITM'd gateway serve poisoned weights of matching size
+//! (corrupted marketplace inference + a parser-RCE surface). Provisioning is
+//! therefore gated on a locally verifiable sha-256 commitment:
 //! - **`isActive`** — never run a deactivated model.
-//! - **CID-addressed fetch** — the weights are requested *by their CID* from a
-//!   content-addressed transport, which self-verifies the multihash at the IPFS
-//!   layer ([`Integrity::CidTransportOnly`]).
-//! - **`sizeBytes`** cross-check **when known** — `ModelRegistry.getModel` does
-//!   *not* return `sizeBytes`, so the caller can pass it only if it read the full
-//!   `models(bytes32)` struct; when supplied we reject a length mismatch
-//!   ([`Integrity::SizeAndCidTransport`]).
+//! - **Caller-supplied digest** ([`Integrity::Sha256Verified`]) — when the
+//!   caller has a trusted `weights_sha256` (registry read / node config), the
+//!   downloaded bytes are hashed locally and must match. Strongest path.
+//! - **Self-verifying CID** ([`Integrity::CidSha256Verified`]) — a CIDv1
+//!   `raw`-codec sha2-256 CID (`bafkrei…`) embeds the sha-256 of the raw bytes;
+//!   we decode it and verify the download against it locally. Equivalent
+//!   strength, no extra registry field needed.
+//! - **Neither available → fail closed** ([`ProvisionError::Unverifiable`]).
+//!   CIDv0 (`Qm…`) / dag-pb CIDs hash the UnixFS DAG, not the raw bytes;
+//!   recomputing them needs a chunker we deliberately do not ship, so they are
+//!   refused unless a `weights_sha256` accompanies them.
+//! - **`sizeBytes`** cross-check **when known** — cheap pre-hash reject.
 //!
-//! Recomputing the IPFS CID/UnixFS multihash from the raw bytes (full content
-//! binding without trusting the transport) needs sha2 + a UnixFS chunker — out of
-//! scope here and logged as tech-debt. We do **not** pretend `ModelRegistry.modelHash`
-//! is a content digest (it is a registration keccak of `owner‖name‖…`).
+//! On any digest mismatch the artifact is deleted, a hard error is returned
+//! (the bytes are never used, cached, or executed), and the event is logged
+//! loudly. We do **not** pretend `ModelRegistry.modelHash` is a content digest
+//! (it is a registration keccak of `owner‖name‖…`).
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// A model present + integrity-checked on local disk, ready to run.
@@ -39,12 +46,19 @@ pub struct ProvisionedModel {
 }
 
 /// The integrity guarantee a [`ProvisionedModel`] carries.
+///
+/// SECREM-01 SVC-2 (pre-audit 2026-06-09): every variant means the sha-256 of
+/// the bytes on disk was recomputed locally and matched a commitment that did
+/// not come from the transport. The pre-fix "transport-only" variants are gone:
+/// unverifiable provisioning is now a hard error, not a weaker success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Integrity {
-    /// Length matched the registry `sizeBytes` AND the fetch was CID-addressed.
-    SizeAndCidTransport,
-    /// CID-addressed fetch only (no `sizeBytes` was available to cross-check).
-    CidTransportOnly,
+    /// sha-256 of the bytes matched the caller-supplied digest
+    /// (`weights_sha256` from the registry read or node config).
+    Sha256Verified,
+    /// sha-256 of the bytes matched the digest embedded in a self-verifying
+    /// CIDv1 `raw`-codec sha2-256 CID, decoded and compared locally.
+    CidSha256Verified,
 }
 
 /// Why provisioning failed.
@@ -54,12 +68,30 @@ pub enum ProvisionError {
     Inactive,
     /// The registry returned an empty `ipfsCID`.
     EmptyCid,
+    /// SECREM-01 SVC-2: no locally verifiable commitment exists — the caller
+    /// supplied no `weights_sha256` and the CID is not a self-verifying
+    /// CIDv1 raw sha2-256 CID. Fail closed before fetching anything.
+    Unverifiable { cid: String },
     /// Fetched byte length did not match the registry `sizeBytes`.
     SizeMismatch { expected: u64, got: u64 },
+    /// SECREM-01 SVC-2: locally recomputed sha-256 of the downloaded bytes did
+    /// not match the expected commitment. The artifact was discarded.
+    DigestMismatch {
+        expected: [u8; 32],
+        got: [u8; 32],
+    },
     /// The weight source failed to deliver the CID.
     Fetch(String),
     /// A local cache I/O error.
     Cache(String),
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
 }
 
 impl core::fmt::Display for ProvisionError {
@@ -67,9 +99,19 @@ impl core::fmt::Display for ProvisionError {
         match self {
             ProvisionError::Inactive => write!(f, "model is deactivated on-chain"),
             ProvisionError::EmptyCid => write!(f, "registry returned an empty ipfsCID"),
+            ProvisionError::Unverifiable { cid } => write!(
+                f,
+                "no local integrity commitment for CID {cid}: supply weights_sha256 or use a CIDv1 raw sha2-256 CID (SVC-2 fail-closed)"
+            ),
             ProvisionError::SizeMismatch { expected, got } => {
                 write!(f, "size mismatch: expected {expected} bytes, got {got}")
             }
+            ProvisionError::DigestMismatch { expected, got } => write!(
+                f,
+                "weights sha-256 mismatch: expected {}, got {} (artifact discarded; SVC-2)",
+                hex32(expected),
+                hex32(got)
+            ),
             ProvisionError::Fetch(m) => write!(f, "weight fetch failed: {m}"),
             ProvisionError::Cache(m) => write!(f, "model cache error: {m}"),
         }
@@ -89,6 +131,59 @@ pub trait WeightSource {
     ) -> impl std::future::Future<Output = Result<Vec<u8>, ProvisionError>> + Send;
 }
 
+/// Locally recompute the sha-256 of `bytes` (SECREM-01 SVC-2: the only digest
+/// we trust is the one we compute ourselves).
+pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// RFC 4648 lowercase base32 (no padding) decode — the multibase `b` alphabet
+/// used by CIDv1. Returns `None` on any non-alphabet character.
+fn base32_lower_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'a'..=b'z' => c - b'a',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        } as u64;
+        acc = (acc << 5) | v;
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+            acc &= (1 << nbits) - 1;
+        }
+    }
+    // Trailing bits must be zero padding (canonical encoding).
+    if nbits >= 5 || acc != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// If `cid` is a **self-verifying** CID — CIDv1, multibase `b` (base32lower),
+/// codec `raw` (0x55), multihash sha2-256 (0x12, len 32) — return the sha-256
+/// of the raw content it commits to. CIDv0 / dag-pb CIDs hash the UnixFS DAG,
+/// not the raw bytes, and are NOT locally recomputable here → `None`.
+fn cid_embedded_sha256(cid: &str) -> Option<[u8; 32]> {
+    let rest = cid.strip_prefix('b')?; // multibase base32lower
+    let bytes = base32_lower_decode(rest)?;
+    // <version=0x01><codec=0x55 raw><mh code=0x12 sha2-256><mh len=0x20><digest:32>
+    if bytes.len() == 36 && bytes[0] == 0x01 && bytes[1] == 0x55 && bytes[2] == 0x12 && bytes[3] == 0x20
+    {
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&bytes[4..36]);
+        Some(d)
+    } else {
+        None
+    }
+}
+
 /// Cache file name for a model: lowercase hex of its `modelHash`, `.bin`.
 fn cache_file(cache_dir: &Path, model_hash: &[u8; 32]) -> PathBuf {
     let mut name = String::with_capacity(64 + 4);
@@ -99,14 +194,22 @@ fn cache_file(cache_dir: &Path, model_hash: &[u8; 32]) -> PathBuf {
     cache_dir.join(name)
 }
 
-/// Provision a model: return a cached copy if present (idempotent), else fetch by
-/// CID, integrity-check, and cache. `expected_size` enables the `sizeBytes`
-/// cross-check when the caller has it (e.g. from the full `models` struct).
+/// Provision a model: return a cached copy if present (idempotent), else fetch
+/// by CID, integrity-check, and cache.
+///
+/// SECREM-01 SVC-2 (pre-audit 2026-06-09): the weights' sha-256 is recomputed
+/// **locally** and compared against a commitment that does not come from the
+/// transport — `expected_sha256` (registry/config `weights_sha256`) when the
+/// caller has it, else the digest embedded in a self-verifying CIDv1 raw
+/// sha2-256 CID. If neither exists, provisioning fails closed *before* any
+/// network fetch. A digest mismatch deletes the artifact and hard-errors; the
+/// bytes are never used. `expected_size` remains a cheap pre-hash cross-check.
 pub async fn provision<S: WeightSource + Sync>(
     model_hash: [u8; 32],
     ipfs_cid: &str,
     is_active: bool,
     expected_size: Option<u64>,
+    expected_sha256: Option<[u8; 32]>,
     cache_dir: &Path,
     source: &S,
 ) -> Result<ProvisionedModel, ProvisionError> {
@@ -117,16 +220,31 @@ pub async fn provision<S: WeightSource + Sync>(
         return Err(ProvisionError::EmptyCid);
     }
 
-    let integrity = match expected_size {
-        Some(_) => Integrity::SizeAndCidTransport,
-        None => Integrity::CidTransportOnly,
+    // SECREM-01 SVC-2: resolve the local integrity commitment BEFORE any fetch.
+    // No commitment → no download (fail closed).
+    let (expected_digest, integrity) = match expected_sha256 {
+        Some(d) => (d, Integrity::Sha256Verified),
+        None => match cid_embedded_sha256(ipfs_cid) {
+            Some(d) => (d, Integrity::CidSha256Verified),
+            None => {
+                eprintln!(
+                    "SECURITY [SVC-2]: refusing to fetch model CID {ipfs_cid}: no weights_sha256 supplied and the CID is not self-verifying (CIDv1 raw sha2-256)"
+                );
+                return Err(ProvisionError::Unverifiable {
+                    cid: ipfs_cid.to_string(),
+                });
+            }
+        },
     };
+
     let path = cache_file(cache_dir, &model_hash);
 
-    // Cache hit: present and (when we know the size) the right size → reuse.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        let len = meta.len();
-        if expected_size.is_none_or(|sz| sz == len) {
+    // Cache hit: re-verify the digest of what's on disk (a cached file is just
+    // an earlier download — it gets no integrity pass). Mismatch → delete and
+    // fall through to a fresh, verified fetch.
+    if let Ok(cached) = std::fs::read(&path) {
+        let len = cached.len() as u64;
+        if expected_size.is_none_or(|sz| sz == len) && sha256_digest(&cached) == expected_digest {
             return Ok(ProvisionedModel {
                 model_hash,
                 path,
@@ -134,7 +252,12 @@ pub async fn provision<S: WeightSource + Sync>(
                 integrity,
             });
         }
-        // Stale/corrupt cache (wrong size) — fall through and re-fetch.
+        // SECREM-01 SVC-2: poisoned/stale cache — discard it loudly.
+        eprintln!(
+            "SECURITY [SVC-2]: cached weights at {} failed local sha-256/size verification; deleting and re-fetching",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     let bytes = source.fetch(ipfs_cid).await?;
@@ -145,6 +268,22 @@ pub async fn provision<S: WeightSource + Sync>(
                 got: bytes.len() as u64,
             });
         }
+    }
+
+    // SECREM-01 SVC-2: recompute the content hash locally BEFORE the bytes are
+    // cached or used. Integrity comes from this recomputation, never from the
+    // gateway. On mismatch: drop the bytes, hard error, no fallback.
+    let got = sha256_digest(&bytes);
+    if got != expected_digest {
+        eprintln!(
+            "SECURITY [SVC-2]: downloaded weights for CID {ipfs_cid} failed local sha-256 verification (expected {}, got {}); artifact discarded — possible gateway compromise or MITM",
+            hex32(&expected_digest),
+            hex32(&got)
+        );
+        return Err(ProvisionError::DigestMismatch {
+            expected: expected_digest,
+            got,
+        });
     }
 
     std::fs::create_dir_all(cache_dir).map_err(|e| ProvisionError::Cache(e.to_string()))?;
@@ -158,8 +297,10 @@ pub async fn provision<S: WeightSource + Sync>(
     })
 }
 
-/// Real weight source: GET `{gateway}/ipfs/{cid}` from a content-addressed IPFS
-/// gateway. The gateway verifies the CID↔content binding at the IPFS layer.
+/// Real weight source: GET `{gateway}/ipfs/{cid}` from an IPFS gateway.
+/// SECREM-01 SVC-2: the gateway is treated as an untrusted transport — the
+/// bytes it returns are verified by [`provision`]'s local sha-256 recomputation,
+/// never by trusting the gateway's CID↔content binding.
 pub struct IpfsGatewaySource {
     gateway: String,
     client: reqwest::Client,
@@ -167,8 +308,7 @@ pub struct IpfsGatewaySource {
 
 impl IpfsGatewaySource {
     /// `gateway` is the base URL, e.g. `http://127.0.0.1:8080` (a local Kubo
-    /// node) — prefer a *local* trusted node so the CID self-verification is
-    /// meaningful.
+    /// node). Even a local node is verified-after-download (SVC-2).
     pub fn new(gateway: impl Into<String>) -> Self {
         Self {
             gateway: gateway.into(),
@@ -231,27 +371,168 @@ mod tests {
         dir
     }
 
+    /// RFC 4648 lowercase base32 (no padding) encode — test-only, to build
+    /// self-verifying CIDv1 raw sha2-256 CIDs for fixtures.
+    fn base32_lower_encode(bytes: &[u8]) -> String {
+        const ALPHA: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut out = String::new();
+        let mut acc: u64 = 0;
+        let mut nbits: u32 = 0;
+        for &b in bytes {
+            acc = (acc << 8) | b as u64;
+            nbits += 8;
+            while nbits >= 5 {
+                nbits -= 5;
+                out.push(ALPHA[((acc >> nbits) & 0x1f) as usize] as char);
+            }
+        }
+        if nbits > 0 {
+            out.push(ALPHA[((acc << (5 - nbits)) & 0x1f) as usize] as char);
+        }
+        out
+    }
+
+    /// Build the CIDv1 raw sha2-256 CID for `content` (multibase `b`).
+    fn cidv1_raw(content: &[u8]) -> String {
+        let d = sha256_digest(content);
+        let mut raw = vec![0x01, 0x55, 0x12, 0x20];
+        raw.extend_from_slice(&d);
+        format!("b{}", base32_lower_encode(&raw))
+    }
+
     #[tokio::test]
-    async fn provisions_and_caches_with_size_match() {
-        let dir = tmp("size-match");
-        let src = FakeSource::new(vec![0xab; 100]);
-        let m = provision([0x01; 32], "bafycid", true, Some(100), &dir, &src)
-            .await
-            .unwrap();
+    async fn provisions_and_caches_with_registry_digest() {
+        let dir = tmp("sha-match");
+        let content = vec![0xab; 100];
+        let src = FakeSource::new(content.clone());
+        let m = provision(
+            [0x01; 32],
+            "QmNotSelfVerifying",
+            true,
+            Some(100),
+            Some(sha256_digest(&content)),
+            &dir,
+            &src,
+        )
+        .await
+        .unwrap();
         assert_eq!(m.bytes_len, 100);
-        assert_eq!(m.integrity, Integrity::SizeAndCidTransport);
+        assert_eq!(m.integrity, Integrity::Sha256Verified);
         assert!(m.path.exists());
         assert_eq!(src.fetch_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SECREM-01 SVC-2: tampered bytes (right size, wrong content — exactly what
+    // a compromised gateway would serve) must be rejected and never cached.
+    #[tokio::test]
+    async fn tampered_bytes_are_rejected_and_not_cached() {
+        let dir = tmp("tampered");
+        let good = vec![0xab; 100];
+        let mut poisoned = good.clone();
+        poisoned[50] ^= 0xff; // same length, different content
+        let src = FakeSource::new(poisoned);
+        let err = provision(
+            [0x07; 32],
+            "QmNotSelfVerifying",
+            true,
+            Some(100),
+            Some(sha256_digest(&good)),
+            &dir,
+            &src,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ProvisionError::DigestMismatch { .. }));
+        // Hard failure: nothing usable left on disk.
+        assert!(!cache_file(&dir, &[0x07; 32]).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SECREM-01 SVC-2: a self-verifying CIDv1 raw sha2-256 CID is recomputed
+    // locally — no registry digest needed.
+    #[tokio::test]
+    async fn self_verifying_cid_is_recomputed_locally() {
+        let dir = tmp("cid-verify");
+        let content = b"genuine model weights".to_vec();
+        let src = FakeSource::new(content.clone());
+        let m = provision([0x08; 32], &cidv1_raw(&content), true, None, None, &dir, &src)
+            .await
+            .unwrap();
+        assert_eq!(m.integrity, Integrity::CidSha256Verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn self_verifying_cid_rejects_tampered_bytes() {
+        let dir = tmp("cid-tampered");
+        let content = b"genuine model weights".to_vec();
+        let src = FakeSource::new(b"poisoned model weights".to_vec());
+        let err = provision([0x09; 32], &cidv1_raw(&content), true, None, None, &dir, &src)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProvisionError::DigestMismatch { .. }));
+        assert!(!cache_file(&dir, &[0x09; 32]).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SECREM-01 SVC-2: no digest + non-self-verifying CID → fail closed BEFORE
+    // any network fetch.
+    #[tokio::test]
+    async fn unverifiable_cid_fails_closed_without_fetching() {
+        let dir = tmp("unverifiable");
+        let src = FakeSource::new(vec![0u8; 10]);
+        for cid in ["QmSomeDagPbCid", "bafybeidagpbnotraw"] {
+            let err = provision([0x0a; 32], cid, true, None, None, &dir, &src)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProvisionError::Unverifiable { .. }));
+        }
+        assert_eq!(src.fetch_count(), 0);
+    }
+
+    // SECREM-01 SVC-2: a poisoned cache file is discarded and re-fetched, and
+    // the replacement is verified.
+    #[tokio::test]
+    async fn poisoned_cache_is_discarded_and_refetched() {
+        let dir = tmp("poisoned-cache");
+        let content = vec![0xcd; 64];
+        let hash = [0x0b; 32];
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(cache_file(&dir, &hash), vec![0xee; 64]).unwrap(); // same size, wrong bytes
+        let src = FakeSource::new(content.clone());
+        let m = provision(
+            hash,
+            "QmX",
+            true,
+            Some(64),
+            Some(sha256_digest(&content)),
+            &dir,
+            &src,
+        )
+        .await
+        .unwrap();
+        assert_eq!(src.fetch_count(), 1); // cache NOT trusted — re-fetched
+        assert_eq!(std::fs::read(&m.path).unwrap(), content);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn size_mismatch_is_rejected() {
         let dir = tmp("size-mismatch");
+        let expected = vec![0xab; 100];
         let src = FakeSource::new(vec![0xab; 50]);
-        let err = provision([0x02; 32], "bafycid", true, Some(100), &dir, &src)
-            .await
-            .unwrap_err();
+        let err = provision(
+            [0x02; 32],
+            "QmX",
+            true,
+            Some(100),
+            Some(sha256_digest(&expected)),
+            &dir,
+            &src,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             ProvisionError::SizeMismatch { expected: 100, got: 50 }
@@ -263,7 +544,7 @@ mod tests {
     async fn inactive_model_is_refused_without_fetching() {
         let dir = tmp("inactive");
         let src = FakeSource::new(vec![0u8; 10]);
-        let err = provision([0x03; 32], "bafycid", false, None, &dir, &src)
+        let err = provision([0x03; 32], "bafycid", false, None, None, &dir, &src)
             .await
             .unwrap_err();
         assert!(matches!(err, ProvisionError::Inactive));
@@ -274,7 +555,7 @@ mod tests {
     async fn empty_cid_is_refused() {
         let dir = tmp("empty-cid");
         let src = FakeSource::new(vec![0u8; 10]);
-        let err = provision([0x04; 32], "", true, None, &dir, &src)
+        let err = provision([0x04; 32], "", true, None, None, &dir, &src)
             .await
             .unwrap_err();
         assert!(matches!(err, ProvisionError::EmptyCid));
@@ -284,15 +565,17 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_short_circuits_fetch() {
         let dir = tmp("cache-hit");
-        let src = FakeSource::new(vec![0xcd; 64]);
+        let content = vec![0xcd; 64];
+        let digest = Some(sha256_digest(&content));
+        let src = FakeSource::new(content);
         let hash = [0x05; 32];
         // First call fetches + caches.
-        provision(hash, "bafycid", true, Some(64), &dir, &src)
+        provision(hash, "QmX", true, Some(64), digest, &dir, &src)
             .await
             .unwrap();
         assert_eq!(src.fetch_count(), 1);
-        // Second call for the same model hits the cache — no new fetch.
-        let m2 = provision(hash, "bafycid", true, Some(64), &dir, &src)
+        // Second call for the same model hits the (digest-verified) cache — no new fetch.
+        let m2 = provision(hash, "QmX", true, Some(64), digest, &dir, &src)
             .await
             .unwrap();
         assert_eq!(src.fetch_count(), 1);
@@ -301,13 +584,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_size_yields_cid_transport_only() {
+    async fn digest_alone_suffices_without_size() {
         let dir = tmp("no-size");
-        let src = FakeSource::new(vec![0x11; 8]);
-        let m = provision([0x06; 32], "bafycid", true, None, &dir, &src)
-            .await
-            .unwrap();
-        assert_eq!(m.integrity, Integrity::CidTransportOnly);
+        let content = vec![0x11; 8];
+        let src = FakeSource::new(content.clone());
+        let m = provision(
+            [0x06; 32],
+            "QmX",
+            true,
+            None,
+            Some(sha256_digest(&content)),
+            &dir,
+            &src,
+        )
+        .await
+        .unwrap();
+        assert_eq!(m.integrity, Integrity::Sha256Verified);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cid_embedded_sha256_parses_only_v1_raw_sha256() {
+        let content = b"abc";
+        let cid = cidv1_raw(content);
+        assert!(cid.starts_with("bafkrei")); // CIDv1 raw sha2-256 prefix
+        assert_eq!(cid_embedded_sha256(&cid), Some(sha256_digest(content)));
+        // CIDv0, dag-pb v1, garbage, wrong multibase → not self-verifying.
+        assert_eq!(cid_embedded_sha256("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"), None);
+        assert_eq!(cid_embedded_sha256("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"), None);
+        assert_eq!(cid_embedded_sha256("not a cid"), None);
+        assert_eq!(cid_embedded_sha256(""), None);
+    }
+
+    #[test]
+    fn base32_roundtrip() {
+        for len in [0usize, 1, 4, 5, 31, 32, 36, 100] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 % 251) as u8).collect();
+            let enc = base32_lower_encode(&data);
+            assert_eq!(base32_lower_decode(&enc), Some(data), "len {len}");
+        }
+        assert_eq!(base32_lower_decode("UPPER"), None);
+        assert_eq!(base32_lower_decode("01"), None); // 0,1 not in alphabet
     }
 }

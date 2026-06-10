@@ -415,6 +415,18 @@ fn build_job_executor(
     };
     let cache_dir = std::env::var("CITRATE_MODEL_CACHE_DIR")
         .unwrap_or_else(|_| "/var/lib/citrate-node-agent/models".to_string());
+    // SECREM-01 SVC-2 (pre-audit 2026-06-09): operator-supplied trusted sha-256
+    // of the model weights (`CITRATE_MODEL_SHA256`, 64 hex chars, optional 0x).
+    // Without it, provisioning succeeds only for self-verifying CIDv1 raw
+    // sha2-256 CIDs and otherwise fails closed — weight integrity is recomputed
+    // locally, never trusted from the IPFS gateway.
+    let weights_sha256 = match std::env::var("CITRATE_MODEL_SHA256").ok() {
+        Some(h) => Some(
+            parse_sha256_hex(&h)
+                .ok_or("CITRATE_MODEL_SHA256 must be 64 hex chars (optional 0x prefix)")?,
+        ),
+        None => None,
+    };
     let nonce = live::random_nonce()?;
 
     Ok(Some(execution::JobExecutor {
@@ -429,6 +441,7 @@ fn build_job_executor(
             marketplace,
             model_registry,
             verifier: chainio::abi::address_from_hex(chainio::compute_verifier())?,
+            weights_sha256, // SECREM-01 SVC-2
         },
         input: live::FileInputSource {
             dir: input_dir.into(),
@@ -439,4 +452,17 @@ fn build_job_executor(
         profiler,
         progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
     }))
+}
+
+/// Parse a 32-byte sha-256 from hex (optional `0x` prefix). SECREM-01 SVC-2.
+fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
