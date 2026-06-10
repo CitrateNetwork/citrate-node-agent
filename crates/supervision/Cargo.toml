@@ -11,6 +11,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
+# Per-instance bearer token for the supervision surface (FUA-NODE-AGENT-01/02):
+# getrandom for the CSPRNG token, subtle for the constant-time compare.
+getrandom = "0.2"
+subtle = "2"
 
 [dev-dependencies]
 # A tiny HTTP client to exercise the live server over an ephemeral TCP port in
