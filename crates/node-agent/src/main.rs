@@ -253,10 +253,19 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     // 2. Shared state + supervision server (loopback only).
     let state: supervision::SharedState = Arc::new(RwLock::new(supervision::AgentState::new()));
     let addr = supervision::resolve_addr()?;
-    println!("node-agent daemon: supervision on http://{addr} (/health /status /pause /resume)");
+    // Per-instance bearer token (FUA-NODE-AGENT-01/02): mint or load it, persisted
+    // 0600, and require it on every endpoint except /health. gui-native reads the
+    // same file (CITRATE_NODE_AGENT_TOKEN_FILE) and presents the token.
+    let token_path = supervision::default_token_path();
+    let auth = supervision::SupervisionAuth::load_or_create(&token_path)
+        .map_err(|e| format!("supervision token at {}: {e}", token_path.display()))?;
+    println!(
+        "node-agent daemon: supervision on http://{addr} (/health open; bearer token at {})",
+        token_path.display()
+    );
     let server_state = state.clone();
     let server = tokio::spawn(async move {
-        if let Err(e) = supervision::serve(addr, server_state).await {
+        if let Err(e) = supervision::serve(addr, server_state, auth).await {
             eprintln!("node-agent: supervision server stopped: {e}");
         }
     });

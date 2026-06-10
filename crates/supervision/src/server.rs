@@ -11,31 +11,36 @@
 //! [`serve`] so tests can mount it on an ephemeral port without committing to a
 //! fixed address.
 //!
-//! ## SECREM-01 SVC-6 (pre-audit 2026-06-09): localhost-trust assumption
+//! ## Access control (SECREM-02 FUA-NODE-AGENT-01/02; SECREM-01 SVC-6)
 //!
-//! This is an unauthenticated control surface — `/pause`, `/resume`, and the
-//! signature-request endpoints mutate agent state and have NO per-request auth.
-//! Its only access control is the loopback bind: any process able to reach
-//! `127.0.0.1:19600` is trusted, on the assumption that it shares the node
-//! operator's trust boundary (the local GUI / signing relay). That assumption
-//! is enforced fail-closed in two places — [`resolve_addr`] and [`serve`] both
-//! reject any non-loopback bind, so the env override cannot widen this surface
-//! to `0.0.0.0` or a routable interface. If per-request auth is ever needed
-//! (e.g. multi-tenant hosts), add it here; do NOT relax the loopback guard.
+//! Two layers, both fail-closed:
+//!   1. **Loopback bind** — [`resolve_addr`] and [`serve`] reject any
+//!      non-loopback address, so the `CITRATE_NODE_AGENT_ADDR` override cannot
+//!      widen this surface to `0.0.0.0` or a routable interface.
+//!   2. **Per-instance bearer token** ([`crate::auth`]) — every endpoint except
+//!      `/health` requires `Authorization: Bearer <token>` matching the token
+//!      minted at startup and persisted `0600`. This closes the residual hole
+//!      the loopback bind left open: an unprivileged local process (can't read
+//!      the `0600` token file) and a web page the operator visits (can't read a
+//!      local file, and the token defeats the no-preflight `/pause`/`/resume`
+//!      CSRF) are both shut out. The signing surface (gui-native) reads the same
+//!      file and presents the token.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    extract::{Path, Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use crate::auth::SupervisionAuth;
 use crate::state::AgentState;
 
 /// The default localhost bind address (env `CITRATE_NODE_AGENT_ADDR` overrides).
@@ -63,15 +68,46 @@ pub fn resolve_addr() -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-/// Build the supervision router over `state`.
-pub fn router(state: SharedState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+/// Token-gate middleware (FUA-NODE-AGENT-01/02). Every protected endpoint must
+/// present `Authorization: Bearer <token>` matching the per-instance supervision
+/// token. A browser cannot read the `0600` token file, so this also closes the
+/// no-preflight CSRF on `/pause` `/resume`; an unprivileged local process cannot
+/// read the daemon-owned token file either. `/health` is intentionally left open
+/// for liveness probes (it exposes no secret).
+async fn require_token(
+    State(auth): State<SupervisionAuth>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    match presented {
+        Some(tok) if auth.verify(tok) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json("missing or invalid supervision token"),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the supervision router over `state`, gating every endpoint except
+/// `/health` behind the per-instance bearer token in `auth`.
+pub fn router(state: SharedState, auth: SupervisionAuth) -> Router {
+    let protected = Router::new()
         .route("/status", get(status))
         .route("/pause", post(pause))
         .route("/resume", post(resume))
         .route("/signature-requests", get(list_signature_requests))
         .route("/signature-requests/:id/observed", post(observe_signature_request))
+        .route_layer(middleware::from_fn_with_state(auth, require_token));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state)
 }
 
@@ -129,7 +165,11 @@ async fn observe_signature_request(
 
 /// Bind the supervision server to `addr` (must be loopback) and serve until the
 /// process exits. Returns an error if binding fails or `addr` is non-loopback.
-pub async fn serve(addr: SocketAddr, state: SharedState) -> Result<(), String> {
+pub async fn serve(
+    addr: SocketAddr,
+    state: SharedState,
+    auth: SupervisionAuth,
+) -> Result<(), String> {
     if !addr.ip().is_loopback() {
         return Err(format!(
             "refusing to bind supervision server to non-loopback {addr}"
@@ -138,7 +178,7 @@ pub async fn serve(addr: SocketAddr, state: SharedState) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("binding supervision server to {addr}: {e}"))?;
-    axum::serve(listener, router(state))
+    axum::serve(listener, router(state, auth))
         .await
         .map_err(|e| format!("supervision server error: {e}"))
 }
@@ -151,11 +191,31 @@ mod tests {
         Arc::new(RwLock::new(AgentState::new()))
     }
 
-    /// Spawn the server on an ephemeral loopback port; return its address.
+    /// The known token every spawned test server is built with.
+    const TEST_TOKEN: &str = "test-supervision-token-0123456789";
+    fn test_auth() -> SupervisionAuth {
+        SupervisionAuth::from_token(TEST_TOKEN)
+    }
+
+    /// A reqwest client that sends the correct bearer token on every request
+    /// (so the existing functional tests exercise the authenticated path).
+    fn authed_client() -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
+
+    /// Spawn the server (gated by [`test_auth`]) on an ephemeral loopback port.
     async fn spawn(state: SharedState) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(state);
+        let app = router(state, test_auth());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -192,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_refuses_non_loopback_bind() {
-        let err = serve("8.8.8.8:19600".parse().unwrap(), shared())
+        let err = serve("8.8.8.8:19600".parse().unwrap(), shared(), test_auth())
             .await
             .unwrap_err();
         assert!(err.contains("non-loopback"), "err was: {err}");
@@ -203,7 +263,7 @@ mod tests {
         let state = shared();
         let addr = spawn(state.clone()).await;
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = authed_client();
 
         // /status → "idle"
         let s: String = client
@@ -238,7 +298,7 @@ mod tests {
         let state = shared();
         let addr = spawn(state.clone()).await;
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = authed_client();
 
         client.post(format!("{base}/pause")).send().await.unwrap();
         assert!(state.read().await.is_paused());
@@ -269,7 +329,7 @@ mod tests {
         }
         let addr = spawn(state.clone()).await;
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = authed_client();
 
         let v: serde_json::Value = client
             .get(format!("{base}/health"))
@@ -307,7 +367,7 @@ mod tests {
         };
         let addr = spawn(state.clone()).await;
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = authed_client();
 
         // GET → one pending request.
         let v: serde_json::Value = client
@@ -352,7 +412,7 @@ mod tests {
         }
         let addr = spawn(state.clone()).await;
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = authed_client();
 
         client.post(format!("{base}/pause")).send().await.unwrap();
 
@@ -367,5 +427,73 @@ mod tests {
         // Paused, but the in-flight job is still counted (it finishes).
         assert_eq!(v["state"], "paused");
         assert_eq!(v["active_jobs"], 1);
+    }
+
+    // ── FUA-NODE-AGENT-01/02: the bearer-token gate ──────────────────────────
+
+    #[tokio::test]
+    async fn protected_endpoints_reject_a_missing_token() {
+        let state = shared();
+        {
+            // Enqueue a write so the read endpoint has the pre-reveal secret to leak.
+            let mut w = state.write().await;
+            w.enqueue_signature_request(
+                "submitResult".into(),
+                "0x11".into(),
+                "0xCAFEBABE_secret_commitment".into(),
+                0,
+                40204,
+                "submitResult job 1".into(),
+                200,
+            );
+        }
+        let addr = spawn(state.clone()).await;
+        let base = format!("http://{addr}");
+        let anon = reqwest::Client::new(); // NO Authorization header
+
+        // The secret-bearing read endpoint must NOT serve an unauthenticated caller.
+        let r = anon.get(format!("{base}/signature-requests")).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+
+        // State-changing endpoints likewise refuse (closes the /pause /resume CSRF).
+        assert_eq!(anon.post(format!("{base}/pause")).send().await.unwrap().status(), 401);
+        assert_eq!(anon.post(format!("{base}/resume")).send().await.unwrap().status(), 401);
+        let r = anon
+            .post(format!("{base}/signature-requests/1/observed"))
+            .json(&serde_json::json!({ "tx_hash": "0xdead" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // The poison-the-queue write never landed: the request is still pending.
+        assert_eq!(state.read().await.signature_requests()[0].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn protected_endpoints_reject_a_wrong_token() {
+        let state = shared();
+        let addr = spawn(state.clone()).await;
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let r = client
+            .get(format!("{base}/signature-requests"))
+            .bearer_auth("not-the-right-token-000000000000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn health_is_open_without_a_token() {
+        // Liveness probes must work unauthenticated; /health exposes no secret.
+        let state = shared();
+        let addr = spawn(state.clone()).await;
+        let base = format!("http://{addr}");
+        let anon = reqwest::Client::new();
+
+        let r = anon.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
     }
 }
