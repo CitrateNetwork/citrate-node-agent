@@ -44,6 +44,20 @@ Run the agent (offline config self-check, or live reads with `CITRATE_RPC_URL`):
 node-agent path/to/compute.json [job-id]
 ```
 
+### Outbound TLS policy (FUA-NODE-AGENT-06)
+
+Every outbound endpoint the agent talks to — `CITRATE_RPC_URL`,
+`CITRATE_IPFS_GATEWAY`, `CITRATE_LLAMA_URL` — must be `https://`, or plain
+`http://` to a **loopback** host only (`localhost` / `127.0.0.0/8` / `[::1]`,
+the local-Kubo / resident-llama-server posture). Anything else fails closed at
+startup with a clear error. For plaintext LAN test rigs only, the **dev-only**
+escape hatch `CITRATE_NODE_AGENT_ALLOW_INSECURE_OUTBOUND=1` re-enables
+plaintext to non-loopback hosts (logged loudly on every use). Never set it in
+production: a MITM between the agent and its RPC can feed false chain-truth
+(job state, the `committed` gate, oracle price). On-chain model CIDs are also
+shape-validated as bare CIDv0/CIDv1 identifiers before any gateway URL is
+built (FUA-NODE-AGENT-05).
+
 ## Crate layout (roadmap)
 
 This repo ships only what is real and compiles — no empty stub crates

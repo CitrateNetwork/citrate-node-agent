@@ -21,7 +21,8 @@ async fn chain_id_matches_canonical_40204() {
         eprintln!("skipping: CITRATE_RPC_URL not set");
         return;
     };
-    let client = chainio::rpc::RpcClient::new(url);
+    let client = chainio::rpc::RpcClient::new(url)
+        .expect("CITRATE_RPC_URL must be https:// or loopback http:// (FUA-NODE-AGENT-06)");
     let id = client.eth_chain_id().await.expect("eth_chainId");
     assert_eq!(id, chainio::CHAIN_ID, "connected chain is not 40204");
 }
@@ -32,7 +33,8 @@ async fn marketplace_address_has_deployed_code() {
         eprintln!("skipping: CITRATE_RPC_URL not set");
         return;
     };
-    let client = chainio::rpc::RpcClient::new(url);
+    let client = chainio::rpc::RpcClient::new(url)
+        .expect("CITRATE_RPC_URL must be https:// or loopback http:// (FUA-NODE-AGENT-06)");
     let marketplace =
         abi::address_from_hex(chainio::compute_marketplace()).expect("canonical address parses");
     let code = client.eth_get_code(marketplace).await.expect("eth_getCode");
@@ -49,7 +51,8 @@ async fn pricing_oracle_returns_a_price() {
         eprintln!("skipping: CITRATE_RPC_URL not set");
         return;
     };
-    let client = chainio::rpc::RpcClient::new(url);
+    let client = chainio::rpc::RpcClient::new(url)
+        .expect("CITRATE_RPC_URL must be https:// or loopback http:// (FUA-NODE-AGENT-06)");
     let oracle =
         abi::address_from_hex(chainio::compute_pricing_oracle()).expect("canonical address parses");
     // saltPerPflopHour() should decode as a uint256 without erroring.

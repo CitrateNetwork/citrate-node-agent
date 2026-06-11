@@ -19,6 +19,12 @@
 //!   node-agent <path-to-compute.json> [job-id]
 //! Env:
 //!   CITRATE_RPC_URL   chain-40204 JSON-RPC endpoint (enables live reads)
+//!
+//! Outbound TLS (FUA-NODE-AGENT-06, SECREM-02 WP 7.4): every outbound endpoint
+//! (`CITRATE_RPC_URL`, `CITRATE_IPFS_GATEWAY`, `CITRATE_LLAMA_URL`) must be
+//! `https://`, or plain `http://` to a **loopback** host only; anything else is
+//! refused at startup. `CITRATE_NODE_AGENT_ALLOW_INSECURE_OUTBOUND=1` is a
+//! **dev-only** escape hatch for plaintext LAN rigs — never set in production.
 
 mod bridge;
 mod clock;
@@ -142,7 +148,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let client = chainio::rpc::RpcClient::new(rpc_url);
+    let client = chainio::rpc::RpcClient::new(rpc_url)?; // FUA-NODE-AGENT-06: https or loopback only
     let chain_id = client.eth_chain_id().await?;
     if chain_id != chainio::CHAIN_ID {
         return Err(format!(
@@ -278,7 +284,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
     let provider_addr = std::env::var("CITRATE_PROVIDER_ADDRESS").ok();
     match (rpc_url, provider_addr) {
         (Some(rpc_url), Some(provider_hex)) => {
-            let client = chainio::rpc::RpcClient::new(rpc_url.clone());
+            let client = chainio::rpc::RpcClient::new(rpc_url.clone())?; // FUA-NODE-AGENT-06: https or loopback only
             let chain_id = client.eth_chain_id().await?;
             if chain_id != chainio::CHAIN_ID {
                 return Err(format!(
@@ -326,7 +332,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                     chain_id,
                 },
                 view: live::LiveClaimableView {
-                    client: chainio::rpc::RpcClient::new(rpc_url.clone()),
+                    client: chainio::rpc::RpcClient::new(rpc_url.clone())?,
                     accounting,
                     me: provider,
                 },
@@ -446,7 +452,7 @@ fn build_job_executor(
         cache_dir: cache_dir.into(),
         nonce,
         view: live::LiveJobView {
-            client: chainio::rpc::RpcClient::new(rpc_url.to_string()),
+            client: chainio::rpc::RpcClient::new(rpc_url.to_string())?,
             marketplace,
             model_registry,
             verifier: chainio::abi::address_from_hex(chainio::compute_verifier())?,
@@ -455,8 +461,8 @@ fn build_job_executor(
         input: live::FileInputSource {
             dir: input_dir.into(),
         },
-        weights: executor::IpfsGatewaySource::new(gateway),
-        inference: executor::LlamaServerInference::new(llama),
+        weights: executor::IpfsGatewaySource::new(gateway)?, // FUA-NODE-AGENT-06
+        inference: executor::LlamaServerInference::new(llama)?, // FUA-NODE-AGENT-06
         signer,
         profiler,
         progress: tokio::sync::Mutex::new(execution::JobProgress::default()),

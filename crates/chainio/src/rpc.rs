@@ -113,12 +113,21 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Create a client for `url` (e.g. the chain-40204 RPC endpoint).
-    pub fn new(url: impl Into<String>) -> Self {
-        RpcClient {
-            url: url.into(),
+    ///
+    /// FUA-NODE-AGENT-06 (SECREM-02 WP 7.4): the endpoint is validated by
+    /// [`crate::outbound::validate_outbound_url`] — plaintext `http://` is
+    /// only accepted for loopback hosts, so a remote RPC must be `https://`.
+    /// The RPC feeds security-relevant truth the executor acts on
+    /// (`JobState`, the `committed` gate, oracle price); fail closed at
+    /// construction rather than letting a MITM shape those reads.
+    pub fn new(url: impl Into<String>) -> Result<Self, crate::outbound::OutboundUrlError> {
+        let url = url.into();
+        crate::outbound::validate_outbound_url(&url)?;
+        Ok(RpcClient {
+            url,
             http: reqwest::Client::new(),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        }
+        })
     }
 
     fn next_id(&self) -> u64 {
