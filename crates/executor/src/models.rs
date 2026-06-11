@@ -649,6 +649,46 @@ mod tests {
         assert_eq!(cid_embedded_sha256(""), None);
     }
 
+    // FUA-NODE-AGENT-05 (RED): an on-chain `ipfsCID` is attacker-registerable.
+    // A malformed / traversal-shaped CID must be rejected *before* any fetch or
+    // gateway-URL construction — even when a trusted digest is supplied (the
+    // digest protects content integrity, not the URL the daemon is sent to).
+    #[tokio::test]
+    async fn malformed_cid_is_rejected_before_fetch() {
+        let dir = tmp("bad-cid");
+        let content = vec![0xab; 4];
+        let digest = Some(sha256_digest(&content));
+        let src = FakeSource::new(content);
+        for cid in [
+            "../../../api/v0/shutdown",                            // path traversal
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG/../x", // traversal suffix
+            "bafkreih?x=1",                                        // query escape
+            "bafkreih#frag",                                       // fragment escape
+            "..%2F..%2Fapi",                                       // encoded traversal
+            "QmX",                                                 // too short for CIDv0
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbd0",      // 0 not in base58btc
+            "BAFKREIUPPERCASE234",                                 // wrong multibase case
+            "ipfs://bafkreih",                                     // scheme smuggling
+        ] {
+            let res = provision([0x0c; 32], cid, true, None, digest, &dir, &src).await;
+            assert!(res.is_err(), "malformed CID {cid:?} was accepted");
+        }
+        assert_eq!(src.fetch_count(), 0, "malformed CID reached the weight source");
+    }
+
+    // FUA-NODE-AGENT-05 (RED): the gateway source itself must refuse to build a
+    // URL from a non-CID identifier (defense in depth below `provision`).
+    #[tokio::test]
+    async fn gateway_source_refuses_non_cid_before_url_construction() {
+        let src = IpfsGatewaySource::new("http://127.0.0.1:1");
+        let err = src.fetch("../../api/v0/shutdown").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid model CID"),
+            "expected a CID-validation rejection, got transport error: {msg}"
+        );
+    }
+
     #[test]
     fn base32_roundtrip() {
         for len in [0usize, 1, 4, 5, 31, 32, 36, 100] {

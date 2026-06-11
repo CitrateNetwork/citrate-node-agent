@@ -17,6 +17,7 @@ pub mod accounting;
 pub mod addrbook;
 pub mod marketplace;
 pub mod model_registry;
+pub mod outbound;
 pub mod rpc;
 pub mod selectors;
 pub mod verifier;
