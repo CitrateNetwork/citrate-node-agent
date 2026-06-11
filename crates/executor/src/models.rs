@@ -68,6 +68,10 @@ pub enum ProvisionError {
     Inactive,
     /// The registry returned an empty `ipfsCID`.
     EmptyCid,
+    /// FUA-NODE-AGENT-05 (SECREM-02 WP 7.4): the on-chain `ipfsCID` is not a
+    /// bare CIDv0/CIDv1 identifier (traversal chars, wrong alphabet, wrong
+    /// shape). Refused before any URL construction or fetch.
+    InvalidCid { cid: String },
     /// SECREM-01 SVC-2: no locally verifiable commitment exists — the caller
     /// supplied no `weights_sha256` and the CID is not a self-verifying
     /// CIDv1 raw sha2-256 CID. Fail closed before fetching anything.
@@ -99,6 +103,10 @@ impl core::fmt::Display for ProvisionError {
         match self {
             ProvisionError::Inactive => write!(f, "model is deactivated on-chain"),
             ProvisionError::EmptyCid => write!(f, "registry returned an empty ipfsCID"),
+            ProvisionError::InvalidCid { cid } => write!(
+                f,
+                "invalid model CID {cid:?}: not a bare CIDv0 (Qm…, base58btc) or CIDv1 (b…, base32lower) identifier; refused before URL construction (FUA-NODE-AGENT-05)"
+            ),
             ProvisionError::Unverifiable { cid } => write!(
                 f,
                 "no local integrity commitment for CID {cid}: supply weights_sha256 or use a CIDv1 raw sha2-256 CID (SVC-2 fail-closed)"
@@ -166,6 +174,36 @@ fn base32_lower_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// FUA-NODE-AGENT-05 (SECREM-02 WP 7.4): shape-validate an on-chain `ipfsCID`
+/// **before** it is interpolated into a gateway URL. The CID string is fully
+/// attacker-controlled (any model owner registers it on-chain), and unvalidated
+/// it can carry `../`, `?`, `#`, or `%2f` and escape the gateway's `/ipfs/`
+/// path (path traversal / limited SSRF). Accepted shapes — both are single
+/// URL-safe path segments by construction:
+/// - **CIDv0**: exactly 46 chars, `Qm` + 44 base58btc chars (no `0OIl`).
+/// - **CIDv1**, multibase `b` (base32lower): `b` + `[a-z2-7]+` that decodes
+///   canonically (zero padding bits) to `<version=0x01>…` with at least
+///   version + codec + multihash code + length bytes.
+///
+/// Anything else — including other multibases — is refused fail-closed;
+/// re-encode the CID as base32lower CIDv1 (`ipfs cid format -b base32`).
+pub fn validate_cid(cid: &str) -> bool {
+    // CIDv0: "Qm" + 44 base58btc chars.
+    if cid.len() == 46 && cid.starts_with("Qm") {
+        return cid.bytes().all(|b| {
+            matches!(b, b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | b'a'..=b'k' | b'm'..=b'z')
+        });
+    }
+    // CIDv1 multibase `b`: base32lower payload decoding to version byte 0x01.
+    if let Some(rest) = cid.strip_prefix('b') {
+        if let Some(bytes) = base32_lower_decode(rest) {
+            // version + codec + multihash (code, length) is the minimum frame.
+            return bytes.len() >= 4 && bytes[0] == 0x01;
+        }
+    }
+    false
+}
+
 /// If `cid` is a **self-verifying** CID — CIDv1, multibase `b` (base32lower),
 /// codec `raw` (0x55), multihash sha2-256 (0x12, len 32) — return the sha-256
 /// of the raw content it commits to. CIDv0 / dag-pb CIDs hash the UnixFS DAG,
@@ -218,6 +256,17 @@ pub async fn provision<S: WeightSource + Sync>(
     }
     if ipfs_cid.is_empty() {
         return Err(ProvisionError::EmptyCid);
+    }
+    // FUA-NODE-AGENT-05: refuse a malformed / traversal-shaped CID before any
+    // URL construction or fetch — the digest below gates *content*, not the
+    // URL the attacker-registered CID would steer the fetch to.
+    if !validate_cid(ipfs_cid) {
+        eprintln!(
+            "SECURITY [FUA-NODE-AGENT-05]: refusing model CID {ipfs_cid:?}: not a bare CIDv0/CIDv1 identifier (possible gateway path traversal)"
+        );
+        return Err(ProvisionError::InvalidCid {
+            cid: ipfs_cid.to_string(),
+        });
     }
 
     // SECREM-01 SVC-2: resolve the local integrity commitment BEFORE any fetch.
@@ -316,22 +365,36 @@ pub struct IpfsGatewaySource {
 impl IpfsGatewaySource {
     /// `gateway` is the base URL, e.g. `http://127.0.0.1:8080` (a local Kubo
     /// node). Even a local node is verified-after-download (SVC-2).
-    pub fn new(gateway: impl Into<String>) -> Self {
+    ///
+    /// FUA-NODE-AGENT-06 (SECREM-02 WP 7.4): the gateway URL is validated by
+    /// [`chainio::outbound::validate_outbound_url`] — plaintext `http://` is
+    /// only accepted for loopback (the local-Kubo posture above); a remote
+    /// gateway must be `https://`. Fail closed at construction.
+    pub fn new(gateway: impl Into<String>) -> Result<Self, chainio::outbound::OutboundUrlError> {
+        let gateway = gateway.into();
+        chainio::outbound::validate_outbound_url(&gateway)?;
         let max_bytes = std::env::var("CITRATE_MAX_WEIGHT_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_MAX_WEIGHT_BYTES);
-        Self {
-            gateway: gateway.into(),
+        Ok(Self {
+            gateway,
             client: reqwest::Client::new(),
             max_bytes,
-        }
+        })
     }
 }
 
 impl WeightSource for IpfsGatewaySource {
     async fn fetch(&self, cid: &str) -> Result<Vec<u8>, ProvisionError> {
+        // FUA-NODE-AGENT-05: defense in depth below `provision` — never build
+        // a gateway URL from a non-CID identifier (`../` would escape /ipfs/).
+        if !validate_cid(cid) {
+            return Err(ProvisionError::InvalidCid {
+                cid: cid.to_string(),
+            });
+        }
         let url = format!("{}/ipfs/{}", self.gateway.trim_end_matches('/'), cid);
         let mut resp = self
             .client
@@ -398,6 +461,11 @@ mod tests {
         }
     }
 
+    /// A grammatically valid (but NOT self-verifying) CIDv0 fixture.
+    const CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+    /// A grammatically valid CIDv1 dag-pb CID (valid shape, not self-verifying).
+    const CIDV1_DAGPB: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
     fn tmp(sub: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("citrate-exec-{sub}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -440,7 +508,7 @@ mod tests {
         let src = FakeSource::new(content.clone());
         let m = provision(
             [0x01; 32],
-            "QmNotSelfVerifying",
+            CIDV0,
             true,
             Some(100),
             Some(sha256_digest(&content)),
@@ -467,7 +535,7 @@ mod tests {
         let src = FakeSource::new(poisoned);
         let err = provision(
             [0x07; 32],
-            "QmNotSelfVerifying",
+            CIDV0,
             true,
             Some(100),
             Some(sha256_digest(&good)),
@@ -515,7 +583,7 @@ mod tests {
     async fn unverifiable_cid_fails_closed_without_fetching() {
         let dir = tmp("unverifiable");
         let src = FakeSource::new(vec![0u8; 10]);
-        for cid in ["QmSomeDagPbCid", "bafybeidagpbnotraw"] {
+        for cid in [CIDV0, CIDV1_DAGPB] {
             let err = provision([0x0a; 32], cid, true, None, None, &dir, &src)
                 .await
                 .unwrap_err();
@@ -536,7 +604,7 @@ mod tests {
         let src = FakeSource::new(content.clone());
         let m = provision(
             hash,
-            "QmX",
+            CIDV0,
             true,
             Some(64),
             Some(sha256_digest(&content)),
@@ -557,7 +625,7 @@ mod tests {
         let src = FakeSource::new(vec![0xab; 50]);
         let err = provision(
             [0x02; 32],
-            "QmX",
+            CIDV0,
             true,
             Some(100),
             Some(sha256_digest(&expected)),
@@ -603,12 +671,12 @@ mod tests {
         let src = FakeSource::new(content);
         let hash = [0x05; 32];
         // First call fetches + caches.
-        provision(hash, "QmX", true, Some(64), digest, &dir, &src)
+        provision(hash, CIDV0, true, Some(64), digest, &dir, &src)
             .await
             .unwrap();
         assert_eq!(src.fetch_count(), 1);
         // Second call for the same model hits the (digest-verified) cache — no new fetch.
-        let m2 = provision(hash, "QmX", true, Some(64), digest, &dir, &src)
+        let m2 = provision(hash, CIDV0, true, Some(64), digest, &dir, &src)
             .await
             .unwrap();
         assert_eq!(src.fetch_count(), 1);
@@ -623,7 +691,7 @@ mod tests {
         let src = FakeSource::new(content.clone());
         let m = provision(
             [0x06; 32],
-            "QmX",
+            CIDV0,
             true,
             None,
             Some(sha256_digest(&content)),
@@ -647,6 +715,73 @@ mod tests {
         assert_eq!(cid_embedded_sha256("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"), None);
         assert_eq!(cid_embedded_sha256("not a cid"), None);
         assert_eq!(cid_embedded_sha256(""), None);
+    }
+
+    // FUA-NODE-AGENT-05: an on-chain `ipfsCID` is attacker-registerable.
+    // A malformed / traversal-shaped CID must be rejected *before* any fetch or
+    // gateway-URL construction — even when a trusted digest is supplied (the
+    // digest protects content integrity, not the URL the daemon is sent to).
+    // (RED evidence: failed pre-fix — '../../../api/v0/shutdown' was accepted.)
+    #[tokio::test]
+    async fn malformed_cid_is_rejected_before_fetch() {
+        let dir = tmp("bad-cid");
+        let content = vec![0xab; 4];
+        let digest = Some(sha256_digest(&content));
+        let src = FakeSource::new(content);
+        for cid in [
+            "../../../api/v0/shutdown",                            // path traversal
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG/../x", // traversal suffix
+            "bafkreih?x=1",                                        // query escape
+            "bafkreih#frag",                                       // fragment escape
+            "..%2F..%2Fapi",                                       // encoded traversal
+            "QmTooShort",                                          // too short for CIDv0
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbd0",      // 0 not in base58btc
+            "BAFKREIUPPERCASE234",                                 // wrong multibase case
+            "ipfs://bafkreih",                                     // scheme smuggling
+            "bafybeidagpbnotraw",                                  // non-canonical base32
+        ] {
+            let res = provision([0x0c; 32], cid, true, None, digest, &dir, &src).await;
+            assert!(
+                matches!(res, Err(ProvisionError::InvalidCid { .. })),
+                "malformed CID {cid:?} was accepted (or mis-classified)"
+            );
+        }
+        assert_eq!(src.fetch_count(), 0, "malformed CID reached the weight source");
+    }
+
+    // FUA-NODE-AGENT-05: the gateway source itself must refuse to build a
+    // URL from a non-CID identifier (defense in depth below `provision`).
+    // (RED evidence: pre-fix the built URL was http://127.0.0.1:1/api/v0/shutdown.)
+    #[tokio::test]
+    async fn gateway_source_refuses_non_cid_before_url_construction() {
+        let src = IpfsGatewaySource::new("http://127.0.0.1:1").unwrap();
+        let err = src.fetch("../../api/v0/shutdown").await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::InvalidCid { .. }),
+            "expected a CID-validation rejection, got transport error: {err}"
+        );
+    }
+
+    // FUA-NODE-AGENT-05: the accept/reject grammar itself.
+    #[test]
+    fn validate_cid_grammar() {
+        // Accepted: bare CIDv0, bare CIDv1 base32lower (dag-pb and raw).
+        assert!(validate_cid(CIDV0));
+        assert!(validate_cid(CIDV1_DAGPB));
+        assert!(validate_cid(&cidv1_raw(b"weights")));
+        // Rejected: everything that is not a single bare CID path segment.
+        for bad in ["", "Qm", "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdGx", "b", "k51qzi5uqu5dl", "not a cid"] {
+            assert!(!validate_cid(bad), "{bad:?} accepted");
+        }
+    }
+
+    // FUA-NODE-AGENT-06: a plaintext remote gateway is refused at construction;
+    // the loopback local-Kubo posture and https remotes remain fine.
+    #[test]
+    fn gateway_source_refuses_plaintext_remote_gateway() {
+        assert!(IpfsGatewaySource::new("http://203.0.113.7:8080").is_err());
+        assert!(IpfsGatewaySource::new("http://127.0.0.1:8080").is_ok());
+        assert!(IpfsGatewaySource::new("https://ipfs.example").is_ok());
     }
 
     #[test]

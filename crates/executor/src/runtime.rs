@@ -61,11 +61,20 @@ pub struct LlamaServerInference {
 
 impl LlamaServerInference {
     /// `base_url` is the resident server, e.g. `http://127.0.0.1:8080`.
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
+    ///
+    /// FUA-NODE-AGENT-06 (SECREM-02 WP 7.4): the endpoint is validated by
+    /// [`chainio::outbound::validate_outbound_url`] — plaintext `http://` is
+    /// only accepted for loopback (the resident-server posture above); a
+    /// remote inference endpoint must be `https://`. Job inputs/outputs cross
+    /// this link and the output feeds the commitment proof, so fail closed at
+    /// construction.
+    pub fn new(base_url: impl Into<String>) -> Result<Self, chainio::outbound::OutboundUrlError> {
+        let base_url = base_url.into();
+        chainio::outbound::validate_outbound_url(&base_url)?;
+        Ok(Self {
+            base_url,
             client: reqwest::Client::new(),
-        }
+        })
     }
 }
 
@@ -165,7 +174,8 @@ mod tests {
             bytes_len: 0,
             integrity: Integrity::Sha256Verified,
         };
-        let engine = LlamaServerInference::new("http://127.0.0.1:1"); // unused — file check first
+        let engine =
+            LlamaServerInference::new("http://127.0.0.1:1").unwrap(); // unused — file check first
         let err = engine.run(&model, b"x").await.unwrap_err();
         assert!(matches!(err, InferenceError::ModelMissing));
     }
@@ -178,8 +188,18 @@ mod tests {
             return; // not configured → skip
         };
         let (model, _p) = fake_model();
-        let engine = LlamaServerInference::new(url);
+        let engine = LlamaServerInference::new(url)
+            .expect("CITRATE_LLAMA_URL must be https:// or loopback http://");
         let out = engine.run(&model, b"Say hello in one word.").await.unwrap();
         assert!(!out.bytes.is_empty());
+    }
+
+    // FUA-NODE-AGENT-06: a plaintext remote inference endpoint is refused at
+    // construction; loopback http and https remote remain fine.
+    #[test]
+    fn llama_adapter_refuses_plaintext_remote_endpoint() {
+        assert!(LlamaServerInference::new("http://203.0.113.7:8080").is_err());
+        assert!(LlamaServerInference::new("http://127.0.0.1:8080").is_ok());
+        assert!(LlamaServerInference::new("https://inference.example:8080").is_ok());
     }
 }
