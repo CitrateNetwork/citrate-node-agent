@@ -21,7 +21,7 @@ baseline_test_count: 187
 |---|---|---|---|---|---|---|---|
 | FUA-NODE-AGENT-01 | High | 2.1 | `server.rs::protected_endpoints_reject_a_missing_token` / `…_wrong_token`; `auth.rs` unit tests | New `auth.rs`: per-instance 256-bit CSPRNG token, persisted `0600`, constant-time verify; `require_token` middleware gates every endpoint except `/health`; `serve`/`router` take `SupervisionAuth`; daemon `load_or_create`s it — `crates/supervision/src/{auth.rs,server.rs,lib.rs}`, `crates/node-agent/src/main.rs` | supervision 30 (was ~24) ✓ | killed (bypass `auth.verify` → 2 gate tests FAIL) | **FIXED** |
 | FUA-NODE-AGENT-02 | Med | 2.1 | `protected_endpoints_reject_a_missing_token` (covers `/pause` `/resume`) | Subsumed by the token gate: `/pause` `/resume` now require the bearer token, which a browser cannot read — closes the no-preflight CSRF | 30 ✓ | as above | **FIXED** |
-| FUA-NODE-AGENT-04 | Med | 4.3 | — | Body/decode caps — deferred to Phase 4.3 (not this WP) | — | — | OPEN (Phase 4.3) |
+| FUA-NODE-AGENT-04 | Med | 4.3 | (real-HTTP test = follow-up) | `IpfsGatewaySource::fetch` rejects an oversized Content-Length, then streams with a running `max_bytes` cap (`CITRATE_MAX_WEIGHT_BYTES`, default 8 GiB) — a malicious gateway can no longer OOM/disk-fill the daemon before the digest check — `crates/executor/src/models.rs` | build-verified | **FIXED (Phase 4.3)** |
 | FUA-NODE-AGENT-03/05/06 | Low/Med | 4.3/7.4 | — | Weight integrity / CID / TLS — Phase 4.3 / 7.4 | — | — | OPEN (later phase) |
 
 ## Notes
