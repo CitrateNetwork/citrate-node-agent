@@ -11,6 +11,9 @@
 use config::Weekday;
 
 /// `(hour, weekday)` in UTC for a given UNIX timestamp (seconds since epoch).
+/// Production samples [`utc_hour_min_weekday`]; this thin wrapper remains for
+/// callers that don't need the minute.
+#[allow(dead_code)]
 pub fn utc_hour_and_weekday(unix_secs: u64) -> (u8, Weekday) {
     let (hour, _, weekday) = utc_hour_min_weekday(unix_secs);
     (hour, weekday)

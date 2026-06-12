@@ -11,8 +11,9 @@
 use std::path::PathBuf;
 
 use bidder::{Caps, ComputePricingOracle};
-use chainio::abi::{self, Address};
+use chainio::abi::Address;
 use chainio::rpc::RpcClient;
+#[cfg(test)]
 use heartbeat::{HeartbeatError, HeartbeatSender};
 
 use crate::bridge;
@@ -200,7 +201,7 @@ impl HeartbeatSender for UnsignedHeartbeatSender {
         Err(HeartbeatError::Send(format!(
             "no signer configured: would broadcast heartbeat() calldata {} \
              (signing/broadcast lands in SELL-S2; keys live in gui-native)",
-            abi::hex_encode(calldata)
+            chainio::abi::hex_encode(calldata)
         )))
     }
 }
