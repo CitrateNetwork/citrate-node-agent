@@ -50,6 +50,14 @@ pub fn address_for(name: &str) -> Option<&'static str> {
     ADDRESS_BOOK.get(name).copied()
 }
 
+/// Every `(name, address)` entry in the vendored canonical book
+/// (`contracts` + `aaStack`), in unspecified order. SELL-S0 uses this to
+/// `eth_getCode`-verify the whole book against the live chain before the
+/// daemon transacts.
+pub fn all_addresses() -> impl Iterator<Item = (&'static str, &'static str)> {
+    ADDRESS_BOOK.iter().map(|(name, addr)| (*name, *addr))
+}
+
 macro_rules! typed_helper {
     ($fn_name:ident, $canonical:literal, $doc:literal) => {
         #[doc = $doc]
