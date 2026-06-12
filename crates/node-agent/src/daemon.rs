@@ -37,6 +37,8 @@ pub struct MarketSnapshot {
     pub caps: Caps,
     /// Provider reputation in basis points (from `getProvider`).
     pub reputation_bps: u32,
+    /// Provider stake in wei (from `getProvider`) — feeds the slash detector.
+    pub stake_wei: u128,
     /// The job under consideration this tick.
     pub job: BidJob,
     /// The pricing oracle reading.
@@ -85,9 +87,12 @@ pub async fn tick<V: MarketView>(state: &SharedState, view: &V, settings: &Setti
 
     {
         let mut w = state.write().await;
-        w.set_provider_stats(
+        // Full observation: also runs the slash + reputation-drop detectors
+        // (SELL-S1 alerts; latched in /health.alert).
+        w.record_provider_observation(
             snapshot.caps.max_concurrent_jobs as u32,
             snapshot.reputation_bps,
+            snapshot.stake_wei,
         );
         // A successful refresh clears any prior transient error.
         w.set_last_error(None);
@@ -204,6 +209,7 @@ mod tests {
                 max_concurrent_jobs: 10,
             },
             reputation_bps: 9230,
+            stake_wei: 1000 * bidder::ONE_SALT_WEI,
             job: BidJob {
                 id: 7,
                 max_price_wei: 4 * bidder::ONE_SALT_WEI,
@@ -306,6 +312,79 @@ mod tests {
         tick(&state, &view, &on_settings()).await;
         // In-flight count survives the paused tick (jobs finish, not cancelled).
         assert_eq!(state.read().await.health_at(0).active_jobs, 2);
+    }
+
+    /// A view that serves a sequence of snapshots (then repeats the last one) —
+    /// for delta-detection tests across ticks.
+    struct SequenceView {
+        snapshots: Mutex<Vec<MarketSnapshot>>,
+        last: MarketSnapshot,
+    }
+    impl MarketView for SequenceView {
+        async fn refresh(&self) -> Result<MarketSnapshot, String> {
+            let mut q = self.snapshots.lock().expect("mutex not poisoned");
+            if q.is_empty() {
+                Ok(self.last.clone())
+            } else {
+                Ok(q.remove(0))
+            }
+        }
+    }
+
+    /// SELL-S1 gate: "slash alert fires in <2 min". The detector runs inside
+    /// every tick, and the production tick interval is the 30s heartbeat
+    /// cadence — so a slash lands in `/health.alert` within ONE tick, 30s,
+    /// well inside the 2-minute budget.
+    #[tokio::test]
+    async fn slash_alert_fires_within_one_tick_of_the_stake_drop() {
+        let state = shared();
+        let healthy = biddable_snapshot();
+        let mut slashed = biddable_snapshot();
+        slashed.stake_wei = healthy.stake_wei - healthy.stake_wei / 20; // -5% slash
+        let view = SequenceView {
+            snapshots: Mutex::new(vec![healthy]),
+            last: slashed,
+        };
+        tick(&state, &view, &on_settings()).await;
+        assert_eq!(
+            state.read().await.health_at(0).alert,
+            None,
+            "no alert before the slash"
+        );
+        tick(&state, &view, &on_settings()).await;
+        let alert = state
+            .read()
+            .await
+            .health_at(0)
+            .alert
+            .expect("slash alert raised on the very tick the stake dropped");
+        assert!(alert.contains("slash"), "alert was: {alert}");
+    }
+
+    /// Reputation drop >5% between ticks surfaces in /health.alert (the GUI
+    /// polls /health and alerts the operator — SELL-S1 BDD line).
+    #[tokio::test]
+    async fn reputation_drop_alert_fires_and_latches() {
+        let state = shared();
+        let healthy = biddable_snapshot();
+        let mut dropped = biddable_snapshot();
+        dropped.reputation_bps = 8700; // 9230 → 8700 is -5.74%
+        let view = SequenceView {
+            snapshots: Mutex::new(vec![healthy]),
+            last: dropped,
+        };
+        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings()).await;
+        let alert = state.read().await.health_at(0).alert.clone()
+            .expect("reputation alert raised");
+        assert!(alert.contains("reputation"), "alert was: {alert}");
+        // A third (now-stable) tick must not clear it — it latches until the
+        // operator acknowledges.
+        tick(&state, &view, &on_settings()).await;
+        assert!(
+            state.read().await.health_at(0).alert.is_some(),
+            "alert latches across healthy ticks"
+        );
     }
 
     #[tokio::test]

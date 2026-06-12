@@ -77,6 +77,7 @@ impl MarketView for LiveMarketView {
         Ok(MarketSnapshot {
             caps,
             reputation_bps: profile.reputation_score_bps as u32,
+            stake_wei: profile.stake_wei,
             job,
             oracle,
         })

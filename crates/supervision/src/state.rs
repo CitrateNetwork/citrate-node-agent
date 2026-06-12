@@ -69,6 +69,11 @@ pub struct Health {
     /// Last error the loop recorded (heartbeat send failure, RPC blip, …), if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Operator alert (slash detected / reputation drop >5% since last poll).
+    /// Latched until [`AgentState::clear_alert`] — a GUI that polls `/health`
+    /// can never miss it between polls (SELL-S1 acceptance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert: Option<String>,
 }
 
 /// One unsigned chain write the daemon needs a signing surface (gui-native /
@@ -138,6 +143,12 @@ pub struct AgentState {
     pending_requests: Vec<PendingSignatureRequest>,
     /// Monotonic id source for `pending_requests`.
     next_request_id: u64,
+    /// Latched operator alert (slash / reputation drop). See [`Health::alert`].
+    alert: Option<String>,
+    /// Reputation at the previous observation, for the >5%-drop detector.
+    prev_reputation_bps: Option<u32>,
+    /// Stake at the previous observation, for the slash detector.
+    prev_stake_wei: Option<u128>,
 }
 
 impl AgentState {
@@ -199,6 +210,59 @@ impl AgentState {
     pub fn set_provider_stats(&mut self, max_concurrent: u32, reputation_bps: u32) {
         self.max_concurrent = max_concurrent;
         self.reputation_bps = reputation_bps;
+    }
+
+    /// Record a full provider observation (capacity, reputation, stake) and
+    /// raise operator alerts on dangerous deltas versus the PREVIOUS
+    /// observation (SELL-S1 acceptance):
+    ///
+    /// - **reputation drop strictly >5%** relative to the last poll
+    ///   (`ComputeLib` weighs reputation at 30% — a sliding score quietly
+    ///   loses every bid), and
+    /// - **any stake decrease** — `ComputeMarketplace` slashes 5% of stake on
+    ///   timeout/failure, so a falling stake means the provider was slashed.
+    ///
+    /// Alerts latch in `/health.alert` until [`Self::clear_alert`] so a GUI
+    /// polling between daemon ticks can never miss one. With the production
+    /// 30s tick cadence, detection is well inside the 2-minute gate.
+    pub fn record_provider_observation(
+        &mut self,
+        max_concurrent: u32,
+        reputation_bps: u32,
+        stake_wei: u128,
+    ) {
+        let mut alerts: Vec<String> = Vec::new();
+        if let Some(prev) = self.prev_reputation_bps {
+            // Strictly >5% relative drop: new < prev * 0.95, in integer math.
+            if u64::from(reputation_bps) * 100 < u64::from(prev) * 95 {
+                alerts.push(format!(
+                    "reputation dropped >5% since last poll: {prev} → {reputation_bps} bps"
+                ));
+            }
+        }
+        if let Some(prev) = self.prev_stake_wei {
+            if stake_wei < prev {
+                alerts.push(format!(
+                    "stake slashed: {prev} → {stake_wei} wei"
+                ));
+            }
+        }
+        if !alerts.is_empty() {
+            self.alert = Some(alerts.join("; "));
+        }
+        self.prev_reputation_bps = Some(reputation_bps);
+        self.prev_stake_wei = Some(stake_wei);
+        self.set_provider_stats(max_concurrent, reputation_bps);
+    }
+
+    /// The latched operator alert, if any.
+    pub fn alert(&self) -> Option<&str> {
+        self.alert.as_deref()
+    }
+
+    /// Clear the latched alert (operator acknowledged it).
+    pub fn clear_alert(&mut self) {
+        self.alert = None;
     }
 
     /// Record a heartbeat sent now (uses the wall clock).
@@ -307,6 +371,7 @@ impl AgentState {
             max_concurrent: self.max_concurrent,
             reputation_bps: self.reputation_bps,
             last_error: self.last_error.clone(),
+            alert: self.alert.clone(),
         }
     }
 }
@@ -434,6 +499,97 @@ mod tests {
         s.set_last_error(Some("boom".into()));
         let json = serde_json::to_string(&s.health_at(0)).unwrap();
         assert!(json.contains("\"last_error\":\"boom\""), "json was: {json}");
+    }
+
+    // ---- SELL-S1 operator alerts (reputation drop >5%, slash) ----
+
+    #[test]
+    fn reputation_drop_over_5pct_raises_alert() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 9230, 1_000_000);
+        assert_eq!(s.health_at(0).alert, None, "first observation never alerts");
+        // 9230 → 8700 bps is a 5.74% relative drop — must alert.
+        s.record_provider_observation(10, 8700, 1_000_000);
+        let alert = s.health_at(0).alert.expect("reputation-drop alert raised");
+        assert!(alert.contains("9230"), "alert was: {alert}");
+        assert!(alert.contains("8700"), "alert was: {alert}");
+        assert!(alert.contains("reputation"), "alert was: {alert}");
+    }
+
+    #[test]
+    fn reputation_drop_of_exactly_5pct_is_quiet() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 10_000, 1_000_000);
+        // 10000 → 9500 is exactly 5%, the spec says strictly >5%.
+        s.record_provider_observation(10, 9_500, 1_000_000);
+        assert_eq!(s.health_at(0).alert, None);
+    }
+
+    #[test]
+    fn reputation_rise_is_quiet() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 9000, 1_000_000);
+        s.record_provider_observation(10, 9600, 1_000_000);
+        assert_eq!(s.health_at(0).alert, None);
+    }
+
+    #[test]
+    fn stake_decrease_raises_slash_alert() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 9230, 1_000_000_000);
+        // ComputeMarketplace slashes 5% of stake on timeout/failure.
+        s.record_provider_observation(10, 9230, 950_000_000);
+        let alert = s.health_at(0).alert.expect("slash alert raised");
+        assert!(alert.contains("slash"), "alert was: {alert}");
+        assert!(alert.contains("1000000000"), "alert was: {alert}");
+        assert!(alert.contains("950000000"), "alert was: {alert}");
+    }
+
+    #[test]
+    fn simultaneous_slash_and_reputation_drop_reports_both() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 9230, 1_000_000_000);
+        s.record_provider_observation(10, 8000, 950_000_000);
+        let alert = s.health_at(0).alert.expect("alert raised");
+        assert!(alert.contains("reputation"), "alert was: {alert}");
+        assert!(alert.contains("slash"), "alert was: {alert}");
+    }
+
+    #[test]
+    fn alert_latches_across_healthy_observations() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(10, 9230, 1_000_000_000);
+        s.record_provider_observation(10, 9230, 950_000_000); // slash
+        assert!(s.health_at(0).alert.is_some());
+        // A later healthy read must NOT silently clear the alert — the
+        // operator may not have polled yet.
+        s.record_provider_observation(10, 9230, 950_000_000);
+        assert!(
+            s.health_at(0).alert.is_some(),
+            "alert must latch until explicitly cleared"
+        );
+        s.clear_alert();
+        assert_eq!(s.health_at(0).alert, None);
+    }
+
+    #[test]
+    fn record_provider_observation_updates_provider_stats() {
+        let mut s = AgentState::new();
+        s.record_provider_observation(7, 8800, 42);
+        let h = s.health_at(0);
+        assert_eq!(h.max_concurrent, 7);
+        assert_eq!(h.reputation_bps, 8800);
+    }
+
+    #[test]
+    fn health_omits_alert_when_none_and_includes_when_set() {
+        let mut s = AgentState::new();
+        let json = serde_json::to_string(&s.health_at(0)).expect("serializes");
+        assert!(!json.contains("alert"), "json was: {json}");
+        s.record_provider_observation(10, 9230, 100);
+        s.record_provider_observation(10, 9230, 50);
+        let json = serde_json::to_string(&s.health_at(0)).expect("serializes");
+        assert!(json.contains("\"alert\":"), "json was: {json}");
     }
 
     #[test]
