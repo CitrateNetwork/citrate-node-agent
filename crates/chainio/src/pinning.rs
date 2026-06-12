@@ -110,24 +110,31 @@ pub fn encode_register_pinner() -> Vec<u8> {
     abi::encode_call(selectors::pin_register_pinner(), &[])
 }
 
-/// `sealCommit(bytes32 cid, uint256 sector, bytes32 commD, bytes32 commR,
-///   bytes32 commC, bytes porepProof)`. `porepProof` is the only dynamic arg →
-/// one trailing offset word + the bytes tail.
+/// `sealCommit(bytes32 cid, uint256 sector, bytes32 replicaID, uint256 epoch,
+///   bytes32 commD, bytes32 commR, bytes32 commC, bytes porepProof)`. The
+///   `replicaID` is the CIRCUIT's Poseidon value (the daemon supplies it; the
+///   contract binds it 1:1 to the pinner — PIN-S6 finding), `epoch` the seal
+///   epoch the proof committed. `porepProof` is the only dynamic arg.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_seal_commit(
     cid: [u8; 32],
     sector: u128,
+    replica_id: [u8; 32],
+    epoch: u128,
     comm_d: [u8; 32],
     comm_r: [u8; 32],
     comm_c: [u8; 32],
     porep_proof: &[u8],
 ) -> Vec<u8> {
-    // Head: cid + sector + commD + commR + commC + proofOffset = 6 words.
-    const HEAD_LEN: usize = 6 * 32;
+    // Head: cid + sector + replicaID + epoch + commD + commR + commC + proofOffset = 8 words.
+    const HEAD_LEN: usize = 8 * 32;
     let proof_tail = abi::encode_bytes_tail(porep_proof);
     let mut out = Vec::with_capacity(4 + HEAD_LEN + proof_tail.len());
     out.extend_from_slice(&selectors::pin_seal_commit());
     out.extend_from_slice(&b32(cid));
     out.extend_from_slice(&u256_word(sector));
+    out.extend_from_slice(&b32(replica_id));
+    out.extend_from_slice(&u256_word(epoch));
     out.extend_from_slice(&b32(comm_d));
     out.extend_from_slice(&b32(comm_r));
     out.extend_from_slice(&b32(comm_c));
@@ -304,22 +311,21 @@ mod tests {
     #[test]
     fn seal_commit_calldata_shape() {
         let proof = vec![0xAB, 0xCD, 0xEF];
-        let cd = encode_seal_commit(CID, 7, COMM_D, [0x0C; 32], [0x0E; 32], &proof);
-        // selector + 6 head words + (len word + padded proof)
+        let rid = [0x9A; 32];
+        let cd = encode_seal_commit(CID, 7, rid, 42, COMM_D, [0x0C; 32], [0x0E; 32], &proof);
+        // 8 head words: cid, sector, replicaID, epoch, commD, commR, commC, proofOffset.
         assert_eq!(&cd[0..4], &selectors::pin_seal_commit());
-        // cid
-        assert_eq!(&cd[4..36], &CID);
-        // sector = 7
-        assert_eq!(&cd[36..68], &word_u128(7));
-        // commD
-        assert_eq!(&cd[68..100], &COMM_D);
-        // proof offset = 6*32 = 192
-        assert_eq!(&cd[4 + 5 * 32..4 + 6 * 32], &word_u128(192));
-        // proof length word = 3
-        assert_eq!(&cd[4 + 6 * 32..4 + 7 * 32], &word_u128(3));
-        // proof bytes, zero-padded to 32
-        assert_eq!(&cd[4 + 7 * 32..4 + 7 * 32 + 3], &proof[..]);
-        assert_eq!(cd.len(), 4 + 6 * 32 + 32 + 32);
+        assert_eq!(&cd[4..36], &CID); // word 0: cid
+        assert_eq!(&cd[36..68], &word_u128(7)); // word 1: sector
+        assert_eq!(&cd[68..100], &rid); // word 2: replicaID
+        assert_eq!(&cd[100..132], &word_u128(42)); // word 3: epoch
+        assert_eq!(&cd[132..164], &COMM_D); // word 4: commD
+        // proof offset = 8*32 = 256 (word 7)
+        assert_eq!(&cd[4 + 7 * 32..4 + 8 * 32], &word_u128(256));
+        // proof length word + padded bytes
+        assert_eq!(&cd[4 + 8 * 32..4 + 9 * 32], &word_u128(3));
+        assert_eq!(&cd[4 + 9 * 32..4 + 9 * 32 + 3], &proof[..]);
+        assert_eq!(cd.len(), 4 + 8 * 32 + 32 + 32);
     }
 
     #[test]

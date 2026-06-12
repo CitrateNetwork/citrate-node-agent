@@ -37,6 +37,10 @@ use chainio::pinning::{PinState, PinStatus, SlotState};
 
 pub use chainio::pinning::{PinState as ChainPinState, SlotState as ChainSlotState};
 
+pub mod runloop;
+pub mod sidecar;
+pub use sidecar::SidecarSealer;
+
 /// One on-chain write the pinning daemon emits (unsigned) for a signing surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinIntent {
@@ -284,12 +288,19 @@ fn sign(
 }
 
 /// Build the `sealCommit` signature request once the [`Sealer`] has produced the
-/// seal artifacts. Separate from [`plan_pin`] because it needs off-chain output
-/// (the planner only says "[`PinAction::Seal`]"). `value_wei = BOND`.
-pub fn seal_commit_request(i: &PinPlanInput, sealed: &SealArtifacts) -> PinSignatureRequest {
+/// seal artifacts. Carries the circuit's `replica_id` + the seal `epoch` (the
+/// contract binds them — PIN-S6 finding). Separate from [`plan_pin`] because it
+/// needs off-chain output. `value_wei = BOND`.
+pub fn seal_commit_request(
+    i: &PinPlanInput,
+    sealed: &SealArtifacts,
+    epoch: u128,
+) -> PinSignatureRequest {
     let calldata = chainio::pinning::encode_seal_commit(
         i.cid,
         i.sector,
+        sealed.replica_id,
+        epoch,
         sealed.comm_d,
         sealed.comm_r,
         sealed.comm_c,
@@ -380,14 +391,34 @@ pub trait PinSigner {
 /// daemon so PoSt proofs reuse CommR/CommC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealArtifacts {
+    /// replicaID = Poseidon(pinnerIdentity ‖ cid ‖ sector) — the proof's public
+    /// input; the daemon binds it on-chain (sealCommit derives the same).
+    pub replica_id: [u8; 32],
     /// Unsealed data Merkle root (content anchor).
     pub comm_d: [u8; 32],
     /// Sealed replica root (per-pinner).
     pub comm_r: [u8; 32],
     /// Column commitment.
     pub comm_c: [u8; 32],
-    /// PoRep proof bytes (Halo2-KZG, circuit_version 2).
+    /// PoRep proof bytes (Halo2-KZG, circuit_version 2), valid at challenge
+    /// index 0 (the contract's sealCommit wire uses challengeNonce=0).
     pub porep_proof: Vec<u8>,
+}
+
+/// Everything the [`Sealer`] needs to seal/prove one (pinner, cid, sector).
+/// The reduced circuit consumes 4 field elements of content (`data`); for a
+/// real CID the daemon derives them from the fetched bytes (testnet-functional
+/// reduced instance — real-size sealing is PIN-P1 f.6, same interface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealInputs {
+    /// The private pre-image of replicaID (e.g. the pinner's address, padded).
+    pub pinner_identity: [u8; 32],
+    pub cid: [u8; 32],
+    pub sector: u128,
+    /// Epoch bound into the seal (the seal block, typically).
+    pub epoch: u128,
+    /// The reduced model content (N=4 field elements), 32-byte BE each.
+    pub data: [[u8; 32]; 4],
 }
 
 /// Errors from the sealer/prover sidecar.
@@ -415,22 +446,20 @@ impl core::fmt::Display for SealerError {
 /// PIN-S6 follow-up — they need the sidecar binary, so no real `Sealer` is
 /// wired by default (repo no-stub rule).
 pub trait Sealer {
-    /// Seal a unique replica of `cid`'s weights at `sector` for `replica_id`,
-    /// returning the seal artifacts (CommD/CommR/CommC + PoRep proof).
+    /// Seal a unique replica + produce the seal-time PoRep proof (index 0).
     fn seal(
         &self,
-        replica_id: [u8; 32],
-        cid: [u8; 32],
-        sector: u128,
+        inputs: &SealInputs,
     ) -> impl std::future::Future<Output = Result<SealArtifacts, SealerError>> + Send;
 
-    /// Produce a PoSt proof (circuit_version 3) over the sealed replica for the
-    /// contract-derived `challenge_nonce`.
+    /// Produce a PoSt proof (circuit_version 3) for the contract-derived
+    /// challenge index (the on-chain committed nonce, which the reduced
+    /// deployment pins so it indexes a real node). Re-seals from `inputs`
+    /// internally — no cached `SealArtifacts` needed.
     fn prove_post(
         &self,
-        replica_id: [u8; 32],
-        sealed: &SealArtifacts,
-        challenge_nonce: [u8; 32],
+        inputs: &SealInputs,
+        challenge_index: u64,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, SealerError>> + Send;
 }
 
@@ -606,12 +635,13 @@ mod tests {
     fn seal_commit_request_carries_bond_and_calldata() {
         let i = input(none_pin(), slot(true, 9_000, 1), true, 100);
         let sealed = SealArtifacts {
+            replica_id: [0x11; 32],
             comm_d: [0xD0; 32],
             comm_r: [0x12; 32],
             comm_c: [0x0C; 32],
             porep_proof: vec![0xAB, 0xCD],
         };
-        let req = seal_commit_request(&i, &sealed);
+        let req = seal_commit_request(&i, &sealed, 1);
         assert_eq!(req.intent, PinIntent::SealCommit);
         assert_eq!(req.value_wei, 10_000); // BOND
         assert_eq!(req.to, INC);
@@ -622,6 +652,7 @@ mod tests {
     fn submit_post_request_sets_deadline_as_expiry() {
         let i = input(none_pin(), slot(true, 9_000, 1), true, 100);
         let sealed = SealArtifacts {
+            replica_id: [0x11; 32],
             comm_d: [0xD0; 32],
             comm_r: [0x12; 32],
             comm_c: [0x0C; 32],
@@ -653,30 +684,35 @@ mod tests {
 
     struct FakeSealer;
     impl Sealer for FakeSealer {
-        async fn seal(
-            &self,
-            replica_id: [u8; 32],
-            _cid: [u8; 32],
-            _sector: u128,
-        ) -> Result<SealArtifacts, SealerError> {
-            // Deterministic, replica-bound artifacts (NOT a real proof — this is
-            // a #[cfg(test)] fixture; the production Sealer is the sidecar).
+        async fn seal(&self, inputs: &SealInputs) -> Result<SealArtifacts, SealerError> {
+            // Deterministic, input-bound artifacts (NOT a real proof — this is a
+            // #[cfg(test)] fixture; the production Sealer is the SidecarSealer).
             Ok(SealArtifacts {
+                replica_id: inputs.pinner_identity,
                 comm_d: [0xD0; 32],
-                comm_r: replica_id,
+                comm_r: inputs.pinner_identity,
                 comm_c: [0x0C; 32],
-                porep_proof: replica_id.to_vec(),
+                porep_proof: inputs.pinner_identity.to_vec(),
             })
         }
         async fn prove_post(
             &self,
-            replica_id: [u8; 32],
-            _sealed: &SealArtifacts,
-            challenge_nonce: [u8; 32],
+            inputs: &SealInputs,
+            challenge_index: u64,
         ) -> Result<Vec<u8>, SealerError> {
-            let mut p = replica_id.to_vec();
-            p.extend_from_slice(&challenge_nonce);
+            let mut p = inputs.pinner_identity.to_vec();
+            p.extend_from_slice(&challenge_index.to_be_bytes());
             Ok(p)
+        }
+    }
+
+    fn fake_inputs(i: &PinPlanInput) -> SealInputs {
+        SealInputs {
+            pinner_identity: chainio::pinning::pin_id(i.me, i.cid, i.sector),
+            cid: i.cid,
+            sector: i.sector,
+            epoch: i.current_block,
+            data: [[0u8; 32]; 4],
         }
     }
 
@@ -687,15 +723,12 @@ mod tests {
         assert_eq!(plan_pin(&i), PinAction::Seal { cid: CID, sector: 0 });
         // Loop: seal via the sealer, build the request, hand to the signer.
         let sealer = FakeSealer;
-        let replica_id = chainio::pinning::pin_id(i.me, i.cid, i.sector);
-        let sealed = sealer
-            .seal(replica_id, i.cid, i.sector)
-            .await
-            .expect("seal");
-        assert_eq!(sealed.comm_r, replica_id);
+        let inputs = fake_inputs(&i);
+        let sealed = sealer.seal(&inputs).await.expect("seal");
+        assert_eq!(sealed.comm_r, inputs.pinner_identity);
         let signer = RecordingPinSigner::default();
         let obs = signer
-            .request(seal_commit_request(&i, &sealed))
+            .request(seal_commit_request(&i, &sealed, 1))
             .await
             .expect("request");
         assert!(obs.tx_hash.is_none());

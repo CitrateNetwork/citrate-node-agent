@@ -71,7 +71,10 @@ selector_fn!(heartbeat, "heartbeat()");
 // shape, tracked in PIN-CR-S1). Reads + write calldata builders live in
 // `pinning.rs`.
 selector_fn!(pin_register_pinner, "registerPinner()");
-selector_fn!(pin_seal_commit, "sealCommit(bytes32,uint256,bytes32,bytes32,bytes32,bytes)");
+selector_fn!(
+    pin_seal_commit,
+    "sealCommit(bytes32,uint256,bytes32,uint256,bytes32,bytes32,bytes32,bytes)"
+);
 selector_fn!(pin_challenge, "challenge(bytes32,uint256)");
 selector_fn!(pin_submit_post, "submitPoSt(bytes32,uint256,bytes32,bytes32,uint256,bytes)");
 selector_fn!(pin_claim, "claim(bytes32,uint256)");
@@ -119,7 +122,7 @@ mod tests {
 
         // IPFSIncentivesV2/V3 (PIN-S6)
         assert_eq!(hex4(pin_register_pinner()), "0xc0d2c428");
-        assert_eq!(hex4(pin_seal_commit()), "0x2a43fcc9");
+        assert_eq!(hex4(pin_seal_commit()), "0x51a0ed88");
         assert_eq!(hex4(pin_challenge()), "0xe2083c18");
         assert_eq!(hex4(pin_submit_post()), "0x43f6b201");
         assert_eq!(hex4(pin_claim()), "0x63f44968");
