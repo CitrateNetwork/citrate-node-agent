@@ -65,6 +65,22 @@ selector_fn!(is_price_stale, "isPriceStale()");
 // --- HeartbeatMonitor (write) ---
 selector_fn!(heartbeat, "heartbeat()");
 
+// --- IPFSIncentivesV2/V3 (PIN-S6 pinning daemon) ---
+// Signatures verbatim from `citrate-chain/contracts/src/IPFSIncentivesV2.sol`
+// (V3 keeps these and adds the commit-reveal `commitChallenge`/`submitPoSt`
+// shape, tracked in PIN-CR-S1). Reads + write calldata builders live in
+// `pinning.rs`.
+selector_fn!(pin_register_pinner, "registerPinner()");
+selector_fn!(pin_seal_commit, "sealCommit(bytes32,uint256,bytes32,bytes32,bytes32,bytes)");
+selector_fn!(pin_challenge, "challenge(bytes32,uint256)");
+selector_fn!(pin_submit_post, "submitPoSt(bytes32,uint256,bytes32,bytes32,uint256,bytes)");
+selector_fn!(pin_claim, "claim(bytes32,uint256)");
+selector_fn!(pin_return_bond, "returnBond(bytes32,uint256)");
+selector_fn!(pin_get_pin, "getPin(address,bytes32,uint256)");
+selector_fn!(pin_get_slot, "getSlot(bytes32,uint256)");
+selector_fn!(pin_owed_of, "owedOf(address,bytes32,uint256)");
+selector_fn!(pin_registered, "registered(address)");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +116,18 @@ mod tests {
         assert_eq!(hex4(is_price_stale()), "0x2f5df725");
 
         assert_eq!(hex4(heartbeat()), "0x3defb962");
+
+        // IPFSIncentivesV2/V3 (PIN-S6)
+        assert_eq!(hex4(pin_register_pinner()), "0xc0d2c428");
+        assert_eq!(hex4(pin_seal_commit()), "0x2a43fcc9");
+        assert_eq!(hex4(pin_challenge()), "0xe2083c18");
+        assert_eq!(hex4(pin_submit_post()), "0x43f6b201");
+        assert_eq!(hex4(pin_claim()), "0x63f44968");
+        assert_eq!(hex4(pin_return_bond()), "0x3ac9dfd3");
+        assert_eq!(hex4(pin_get_pin()), "0x61793215");
+        assert_eq!(hex4(pin_get_slot()), "0x68752a81");
+        assert_eq!(hex4(pin_owed_of()), "0xabb31086");
+        assert_eq!(hex4(pin_registered()), "0xb2dd5c07");
     }
 
     /// Sanity: a known ERC-20 selector to prove our keccak derivation is sound.
