@@ -18,6 +18,7 @@ pub mod addrbook;
 pub mod marketplace;
 pub mod model_registry;
 pub mod outbound;
+pub mod pinning;
 pub mod rpc;
 pub mod selectors;
 pub mod verifier;
