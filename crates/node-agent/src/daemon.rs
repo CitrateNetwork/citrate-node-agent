@@ -67,9 +67,12 @@ pub trait BidPlacer {
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
-/// Explicit no-op placer (one-shot mode / tests that only assert decisions).
+/// Explicit no-op placer for tests that only assert decisions. Test-only —
+/// every production loop places bids through the relay.
+#[cfg(test)]
 pub struct NoBids;
 
+#[cfg(test)]
 impl BidPlacer for NoBids {
     async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
         Ok(())

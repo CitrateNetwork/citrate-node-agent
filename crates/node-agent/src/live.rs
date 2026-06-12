@@ -182,13 +182,16 @@ pub fn random_nonce() -> Result<[u8; 32], String> {
 
 /// The honest heartbeat sender for the unsigned read-only agent.
 ///
-/// The agent holds no keys (gui-native owns the keystore; signed broadcast is
-/// SELL-S2). Rather than fake a successful `heartbeat()` broadcast — which would
-/// be a lie that leaves the provider unknowingly headed for suspension — this
-/// sender returns an explicit error every tick. The daemon loop records it in
-/// `last_error` so the GUI's `/health` surfaces the real, un-broadcast state.
+/// The agent holds no keys (gui-native owns the keystore). Rather than fake a
+/// successful `heartbeat()` broadcast — which would be a lie that leaves the
+/// provider unknowingly headed for suspension — this sender returns an explicit
+/// error every tick. Superseded in the live loop by
+/// `relay::RelayHeartbeatSender` (the recurring relay write); kept under
+/// `cfg(test)` as the documented honest-failure reference.
+#[cfg(test)]
 pub struct UnsignedHeartbeatSender;
 
+#[cfg(test)]
 impl HeartbeatSender for UnsignedHeartbeatSender {
     async fn send_heartbeat(
         &self,
