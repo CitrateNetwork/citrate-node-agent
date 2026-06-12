@@ -317,6 +317,50 @@ impl AgentState {
         id
     }
 
+    /// Enqueue a **recurring** unsigned write (the heartbeat). Identical
+    /// calldata recurs forever, so plain dedup-by-calldata would sign it
+    /// exactly once and the provider would be suspended. Semantics:
+    ///
+    /// - no entry with this calldata → enqueue as `pending` (like
+    ///   [`Self::enqueue_signature_request`]);
+    /// - entry exists and is `pending` → no-op (still awaiting the signer);
+    /// - entry exists and is `submitted` → **re-arm**: flip it back to
+    ///   `pending` (same id, tx_hash cleared) so the signing surface signs
+    ///   the next beat. At-most-once per arming holds — the relay only acts
+    ///   on `pending` and the entry is `submitted` between observe and re-arm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_recurring_signature_request(
+        &mut self,
+        intent: String,
+        to: String,
+        calldata: String,
+        value_wei: u128,
+        chain_id: u64,
+        context: String,
+        expires_block: u128,
+    ) -> u64 {
+        if let Some(existing) = self
+            .pending_requests
+            .iter_mut()
+            .find(|r| r.calldata == calldata)
+        {
+            if existing.status == "submitted" {
+                existing.status = "pending".to_string();
+                existing.tx_hash = None;
+            }
+            return existing.id;
+        }
+        self.enqueue_signature_request(
+            intent,
+            to,
+            calldata,
+            value_wei,
+            chain_id,
+            context,
+            expires_block,
+        )
+    }
+
     /// All queued requests (pending + submitted), for `GET /signature-requests`.
     pub fn signature_requests(&self) -> Vec<PendingSignatureRequest> {
         self.pending_requests.clone()
@@ -325,14 +369,20 @@ impl AgentState {
     /// Mark a request observed (signed + broadcast) with its `tx_hash`. Returns
     /// `false` if no such id. Submitted entries stay (so a chain-lag re-emit
     /// still dedups and can't double-broadcast).
+    ///
+    /// An observed **heartbeat** also records the heartbeat timestamp — the
+    /// broadcast is the real liveness proof, so `/health.heartbeat_age` tracks
+    /// observed broadcasts, never optimistic queueing.
     pub fn mark_request_observed(&mut self, id: u64, tx_hash: String) -> bool {
-        if let Some(r) = self.pending_requests.iter_mut().find(|r| r.id == id) {
-            r.status = "submitted".to_string();
-            r.tx_hash = Some(tx_hash);
-            true
-        } else {
-            false
+        let Some(r) = self.pending_requests.iter_mut().find(|r| r.id == id) else {
+            return false;
+        };
+        r.status = "submitted".to_string();
+        r.tx_hash = Some(tx_hash);
+        if r.intent == "heartbeat" {
+            self.record_heartbeat();
         }
+        true
     }
 
     // ---- derived views (read by the HTTP handlers) ----
@@ -682,5 +732,96 @@ mod tests {
     fn mark_observed_unknown_id_is_false() {
         let mut s = AgentState::new();
         assert!(!s.mark_request_observed(99, "0x".into()));
+    }
+
+    // ---- recurring writes (the heartbeat re-arm) ----
+
+    fn enqueue_heartbeat(s: &mut AgentState) -> u64 {
+        s.enqueue_recurring_signature_request(
+            "heartbeat".into(),
+            "0x22".into(),
+            "0x3defb962".into(),
+            0,
+            40204,
+            "heartbeat (provider liveness)".into(),
+            0,
+        )
+    }
+
+    #[test]
+    fn recurring_enqueue_rearms_a_submitted_entry() {
+        let mut s = AgentState::new();
+        let id = enqueue_heartbeat(&mut s);
+        assert_eq!(s.signature_requests()[0].status, "pending");
+        // While still pending, re-enqueue is a no-op (no duplicate, same id).
+        assert_eq!(enqueue_heartbeat(&mut s), id);
+        assert_eq!(s.signature_requests().len(), 1);
+        // Signed + observed → submitted.
+        assert!(s.mark_request_observed(id, "0xbeef".into()));
+        assert_eq!(s.signature_requests()[0].status, "submitted");
+        // Next beat re-arms the SAME entry back to pending, hash cleared.
+        assert_eq!(enqueue_heartbeat(&mut s), id);
+        let r = &s.signature_requests()[0];
+        assert_eq!(r.status, "pending");
+        assert_eq!(r.tx_hash, None);
+        assert_eq!(s.signature_requests().len(), 1, "never duplicates");
+    }
+
+    #[test]
+    fn one_shot_enqueue_never_rearms() {
+        let mut s = AgentState::new();
+        let id = s.enqueue_signature_request(
+            "completeJob".into(),
+            "0x11".into(),
+            "0xdddd".into(),
+            0,
+            40204,
+            "ctx".into(),
+            0,
+        );
+        assert!(s.mark_request_observed(id, "0xbeef".into()));
+        // A chain-lag re-emit of a ONE-SHOT write must stay submitted.
+        let again = s.enqueue_signature_request(
+            "completeJob".into(),
+            "0x11".into(),
+            "0xdddd".into(),
+            0,
+            40204,
+            "ctx".into(),
+            0,
+        );
+        assert_eq!(again, id);
+        assert_eq!(s.signature_requests()[0].status, "submitted");
+    }
+
+    #[test]
+    fn observed_heartbeat_records_liveness_timestamp() {
+        let mut s = AgentState::new();
+        let id = enqueue_heartbeat(&mut s);
+        assert_eq!(
+            s.health_at(1000).heartbeat_age_secs, None,
+            "queueing alone is not liveness"
+        );
+        assert!(s.mark_request_observed(id, "0xbeef".into()));
+        assert!(
+            s.health().heartbeat_age_secs.is_some(),
+            "the observed broadcast IS the liveness proof"
+        );
+    }
+
+    #[test]
+    fn observed_non_heartbeat_does_not_record_liveness() {
+        let mut s = AgentState::new();
+        let id = s.enqueue_signature_request(
+            "startExecution".into(),
+            "0x11".into(),
+            "0xaaaa".into(),
+            0,
+            40204,
+            "ctx".into(),
+            200,
+        );
+        assert!(s.mark_request_observed(id, "0xbeef".into()));
+        assert_eq!(s.health_at(1000).heartbeat_age_secs, None);
     }
 }

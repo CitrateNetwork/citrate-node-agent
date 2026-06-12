@@ -312,7 +312,15 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                 profiler: profiler.clone(),
                 secs_per_block,
             };
-            let sender = live::UnsignedHeartbeatSender;
+            // Liveness + bids go through the signing relay like every other
+            // write (ADR-agent-signing): heartbeat() re-arms each beat;
+            // bidOnJob is enqueued when the bidder decides to bid.
+            let sender = relay::RelayHeartbeatSender::new(
+                state.clone(),
+                abi::address_from_hex(chainio::heartbeat_monitor())?,
+                chain_id,
+            );
+            let bid_placer = relay::RelayBidPlacer::new(state.clone(), marketplace, chain_id);
 
             // The signing relay: unsigned writes are enqueued into the shared
             // supervision state for gui-native to sign + broadcast + observe.
@@ -355,6 +363,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                         &view,
                         &sender,
                         &execution::Both(exec, earnings),
+                        &bid_placer,
                         &bid_settings,
                         heartbeat::HEARTBEAT_INTERVAL,
                         None,
@@ -372,6 +381,7 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
                         &view,
                         &sender,
                         &earnings,
+                        &bid_placer,
                         &bid_settings,
                         heartbeat::HEARTBEAT_INTERVAL,
                         None,

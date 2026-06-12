@@ -190,7 +190,10 @@ pub fn random_nonce() -> Result<[u8; 32], String> {
 pub struct UnsignedHeartbeatSender;
 
 impl HeartbeatSender for UnsignedHeartbeatSender {
-    async fn send_heartbeat(&self, calldata: &[u8]) -> Result<(), HeartbeatError> {
+    async fn send_heartbeat(
+        &self,
+        calldata: &[u8],
+    ) -> Result<heartbeat::SendOutcome, HeartbeatError> {
         Err(HeartbeatError::Send(format!(
             "no signer configured: would broadcast heartbeat() calldata {} \
              (signing/broadcast lands in SELL-S2; keys live in gui-native)",

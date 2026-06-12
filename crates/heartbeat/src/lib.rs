@@ -25,16 +25,29 @@ pub fn heartbeat_calldata() -> Vec<u8> {
     chainio::selectors::heartbeat().to_vec()
 }
 
+/// What a successful `send_heartbeat` actually did — the daemon records a
+/// heartbeat timestamp only for a real broadcast, not for a queued request
+/// (a queued heartbeat is recorded when the signing surface reports it
+/// observed, so `/health.heartbeat_age` never lies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The tx was signed + broadcast by this sender.
+    Broadcast,
+    /// The write was queued for an external signing surface (ADR-agent-signing);
+    /// broadcast happens later and is reported via the observe callback.
+    Queued,
+}
+
 /// Abstracts the act of broadcasting a signed `heartbeat()` transaction. The
-/// node-agent binary implements this over the RPC client + gui-native signer;
-/// tests implement a counting fake.
+/// node-agent binary implements this over the signing-relay queue (the daemon
+/// holds no keys); tests implement a counting fake.
 pub trait HeartbeatSender {
-    /// Send one heartbeat transaction carrying `calldata`. Returns `Ok(())` on
-    /// a successfully broadcast tx.
+    /// Send one heartbeat transaction carrying `calldata`. Returns what
+    /// happened on success ([`SendOutcome`]).
     fn send_heartbeat(
         &self,
         calldata: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), HeartbeatError>> + Send;
+    ) -> impl std::future::Future<Output = Result<SendOutcome, HeartbeatError>> + Send;
 }
 
 /// Error broadcasting a heartbeat.
@@ -116,7 +129,7 @@ mod tests {
         fail_first: bool,
     }
     impl HeartbeatSender for Counting {
-        async fn send_heartbeat(&self, calldata: &[u8]) -> Result<(), HeartbeatError> {
+        async fn send_heartbeat(&self, calldata: &[u8]) -> Result<SendOutcome, HeartbeatError> {
             let mut beats = self.beats.lock().unwrap();
             let n = beats.len();
             beats.push(calldata.to_vec());
@@ -124,7 +137,7 @@ mod tests {
             if self.fail_first && n == 0 {
                 return Err(HeartbeatError::Send("simulated blip".into()));
             }
-            Ok(())
+            Ok(SendOutcome::Broadcast)
         }
     }
 

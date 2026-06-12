@@ -69,6 +69,13 @@ pub enum WriteIntent {
     CompleteJob,
     /// `ContributionAccounting.claimRewards()` — sweep accrued earnings.
     ClaimRewards,
+    /// `ComputeMarketplace.bidOnJob(uint256,uint256,uint256)` — place the
+    /// cost-plus bid the bidder decided (SELL-S1: the bid must actually reach
+    /// the chain to be won).
+    BidOnJob,
+    /// `HeartbeatMonitor.heartbeat()` — the recurring liveness write that
+    /// keeps the provider un-suspended (SELL-S1).
+    Heartbeat,
 }
 
 impl WriteIntent {
@@ -80,6 +87,8 @@ impl WriteIntent {
             WriteIntent::SubmitResult => "submitResult",
             WriteIntent::CompleteJob => "completeJob",
             WriteIntent::ClaimRewards => "claimRewards",
+            WriteIntent::BidOnJob => "bidOnJob",
+            WriteIntent::Heartbeat => "heartbeat",
         }
     }
 }
@@ -471,6 +480,23 @@ mod tests {
         ] {
             let j = job(7, s, ME, 200);
             assert_eq!(plan(&input(&j, 300, true, None)), LifecycleAction::Abort(r));
+        }
+    }
+
+    /// The signing-surface labels are part of the relay wire contract
+    /// (citrate-native's validator matches on them) — pin every one.
+    #[test]
+    fn write_intent_labels_are_pinned() {
+        for (intent, label) in [
+            (WriteIntent::StartExecution, "startExecution"),
+            (WriteIntent::SubmitCommitment, "submitCommitment"),
+            (WriteIntent::SubmitResult, "submitResult"),
+            (WriteIntent::CompleteJob, "completeJob"),
+            (WriteIntent::ClaimRewards, "claimRewards"),
+            (WriteIntent::BidOnJob, "bidOnJob"),
+            (WriteIntent::Heartbeat, "heartbeat"),
+        ] {
+            assert_eq!(intent.label(), label);
         }
     }
 

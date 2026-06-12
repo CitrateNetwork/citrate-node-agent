@@ -53,6 +53,29 @@ pub trait MarketView {
     ) -> impl std::future::Future<Output = Result<MarketSnapshot, String>> + Send;
 }
 
+/// Places the bid the bidder decided (SELL-S1: deciding is not bidding — the
+/// write must reach the chain to be won). The production implementation
+/// enqueues an unsigned `bidOnJob` for the signing relay; tests use a
+/// recording fake; [`NoBids`] is the explicit no-op for bid-less loops.
+pub trait BidPlacer {
+    /// Request the `bidOnJob(job_id, price_wei, estimated_latency_ms)` write.
+    fn place(
+        &self,
+        job_id: u128,
+        price_wei: u128,
+        estimated_latency_ms: u128,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// Explicit no-op placer (one-shot mode / tests that only assert decisions).
+pub struct NoBids;
+
+impl BidPlacer for NoBids {
+    async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// The decision recorded for one tick (for tests + logging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickOutcome {
@@ -73,7 +96,12 @@ pub enum TickOutcome {
 /// bidder and records bidding/idle. Returns what happened so the caller/tests
 /// can assert. Heartbeat sending is handled by the surrounding loop on its own
 /// cadence, not here.
-pub async fn tick<V: MarketView>(state: &SharedState, view: &V, settings: &Settings) -> TickOutcome {
+pub async fn tick<V: MarketView, B: BidPlacer>(
+    state: &SharedState,
+    view: &V,
+    settings: &Settings,
+    bids: &B,
+) -> TickOutcome {
     // 1–2. Refresh the chain view and push provider stats into shared state.
     let snapshot = match view.refresh().await {
         Ok(s) => s,
@@ -105,14 +133,25 @@ pub async fn tick<V: MarketView>(state: &SharedState, view: &V, settings: &Setti
 
     // Run the pure bidder and record the resulting tick state.
     let decision = bidder::evaluate(&snapshot.job, &snapshot.oracle, settings, &snapshot.caps);
-    let mut w = state.write().await;
     match decision {
-        BidDecision::Bid { .. } => {
+        BidDecision::Bid {
+            job_id, price_wei, ..
+        } => {
+            // Deciding is not bidding: hand the write to the placer so it
+            // actually reaches the chain (via the signing relay). The
+            // estimated-latency arg mirrors the one-shot path: exec estimate
+            // in milliseconds.
+            let latency_ms = u128::from(snapshot.job.estimated_exec_secs) * 1000;
+            let placed = bids.place(u128::from(job_id), price_wei, latency_ms).await;
+            let mut w = state.write().await;
+            if let Err(e) = placed {
+                w.set_last_error(Some(format!("bid placement failed: {e}")));
+            }
             w.set_bidding(true);
             TickOutcome::Bid
         }
         BidDecision::Skip { .. } => {
-            w.set_idle();
+            state.write().await.set_idle();
             TickOutcome::NoBid
         }
     }
@@ -124,14 +163,18 @@ pub async fn tick<V: MarketView>(state: &SharedState, view: &V, settings: &Setti
 pub async fn beat<S: HeartbeatSender>(
     state: &SharedState,
     sender: &S,
-) -> Result<(), HeartbeatError> {
+) -> Result<heartbeat::SendOutcome, HeartbeatError> {
     let calldata = heartbeat::heartbeat_calldata();
     let res = sender.send_heartbeat(&calldata).await;
     let mut w = state.write().await;
     match &res {
-        Ok(()) => {
+        // Only a real broadcast is liveness. A QUEUED beat is recorded when
+        // the signing surface reports it observed (supervision does that on
+        // the observe callback) — /health.heartbeat_age never lies.
+        Ok(heartbeat::SendOutcome::Broadcast) => {
             w.record_heartbeat();
         }
+        Ok(heartbeat::SendOutcome::Queued) => {}
         Err(e) => {
             w.set_last_error(Some(e.to_string()));
         }
@@ -146,11 +189,13 @@ pub async fn beat<S: HeartbeatSender>(
 /// one beat per tick here; in production the tick interval *is* the heartbeat
 /// interval). The loop never returns on a heartbeat error — it records it and
 /// keeps going.
-pub async fn run_loop<V, S, E>(
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop<V, S, E, B>(
     state: SharedState,
     view: &V,
     sender: &S,
     executor: &E,
+    bids: &B,
     settings: &Settings,
     interval: Duration,
     max_ticks: Option<u64>,
@@ -158,6 +203,7 @@ pub async fn run_loop<V, S, E>(
     V: MarketView,
     S: HeartbeatSender,
     E: TickExecutor,
+    B: BidPlacer,
 {
     let mut ticks: u64 = 0;
     loop {
@@ -166,7 +212,7 @@ pub async fn run_loop<V, S, E>(
                 return;
             }
         }
-        tick(&state, view, settings).await;
+        tick(&state, view, settings, bids).await;
         executor.tick(&state).await; // drive a won job (no-op in the bid-only loop)
         let _ = beat(&state, sender).await; // errors are recorded, never fatal
         ticks += 1;
@@ -245,9 +291,12 @@ mod tests {
         beats: Mutex<u64>,
     }
     impl HeartbeatSender for CountingSender {
-        async fn send_heartbeat(&self, _calldata: &[u8]) -> Result<(), HeartbeatError> {
+        async fn send_heartbeat(
+            &self,
+            _calldata: &[u8],
+        ) -> Result<heartbeat::SendOutcome, HeartbeatError> {
             *self.beats.lock().unwrap() += 1;
-            Ok(())
+            Ok(heartbeat::SendOutcome::Broadcast)
         }
     }
 
@@ -258,7 +307,7 @@ mod tests {
             snapshot: biddable_snapshot(),
             fail: false,
         };
-        let out = tick(&state, &view, &on_settings()).await;
+        let out = tick(&state, &view, &on_settings(), &NoBids).await;
         assert_eq!(out, TickOutcome::Bid);
         let h = state.read().await.health_at(0);
         assert_eq!(h.state.as_str(), "bidding");
@@ -276,7 +325,7 @@ mod tests {
         };
         let mut s = on_settings();
         s.enabled = false; // bidder returns Skip(Disabled)
-        let out = tick(&state, &view, &s).await;
+        let out = tick(&state, &view, &s, &NoBids).await;
         assert_eq!(out, TickOutcome::NoBid);
         assert_eq!(state.read().await.health_at(0).state.as_str(), "idle");
     }
@@ -289,7 +338,7 @@ mod tests {
             snapshot: biddable_snapshot(),
             fail: false,
         };
-        let out = tick(&state, &view, &on_settings()).await;
+        let out = tick(&state, &view, &on_settings(), &NoBids).await;
         assert_eq!(out, TickOutcome::SkippedPaused);
         // Still paused, never flipped to bidding even though the job was biddable.
         assert_eq!(state.read().await.health_at(0).state.as_str(), "paused");
@@ -309,7 +358,7 @@ mod tests {
             snapshot: biddable_snapshot(),
             fail: false,
         };
-        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
         // In-flight count survives the paused tick (jobs finish, not cancelled).
         assert_eq!(state.read().await.health_at(0).active_jobs, 2);
     }
@@ -331,6 +380,65 @@ mod tests {
         }
     }
 
+    /// A recording bid placer (Send + Sync) for the bid-path tests.
+    struct RecordingPlacer {
+        placed: Mutex<Vec<(u128, u128, u128)>>,
+    }
+    impl BidPlacer for RecordingPlacer {
+        async fn place(
+            &self,
+            job_id: u128,
+            price_wei: u128,
+            latency_ms: u128,
+        ) -> Result<(), String> {
+            self.placed
+                .lock()
+                .expect("mutex not poisoned")
+                .push((job_id, price_wei, latency_ms));
+            Ok(())
+        }
+    }
+
+    /// SELL-S1: a Bid decision must actually place the bid (deciding ≠ bidding).
+    #[tokio::test]
+    async fn bid_decision_places_the_bid_with_cost_plus_price() {
+        let state = shared();
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+        };
+        let out = tick(&state, &view, &on_settings(), &placer).await;
+        assert_eq!(out, TickOutcome::Bid);
+        let placed = placer.placed.lock().expect("mutex not poisoned");
+        assert_eq!(placed.len(), 1, "exactly one bid placed");
+        let (job_id, price_wei, latency_ms) = placed[0];
+        assert_eq!(job_id, 7);
+        // Cost-plus: cost = 1 PFLOP-hour × 1 SALT = 1 SALT; bid = cost × 1.15.
+        assert_eq!(price_wei, bidder::ONE_SALT_WEI * 115 / 100);
+        // Latency arg mirrors the exec estimate, in milliseconds.
+        assert_eq!(latency_ms, 600 * 1000);
+    }
+
+    /// A Skip decision must never reach the placer.
+    #[tokio::test]
+    async fn skip_decision_places_no_bid() {
+        let state = shared();
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+        };
+        let mut s = on_settings();
+        s.enabled = false;
+        tick(&state, &view, &s, &placer).await;
+        assert!(placer.placed.lock().expect("mutex not poisoned").is_empty());
+    }
+
     /// SELL-S1 gate: "slash alert fires in <2 min". The detector runs inside
     /// every tick, and the production tick interval is the 30s heartbeat
     /// cadence — so a slash lands in `/health.alert` within ONE tick, 30s,
@@ -345,13 +453,13 @@ mod tests {
             snapshots: Mutex::new(vec![healthy]),
             last: slashed,
         };
-        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
         assert_eq!(
             state.read().await.health_at(0).alert,
             None,
             "no alert before the slash"
         );
-        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
         let alert = state
             .read()
             .await
@@ -373,14 +481,14 @@ mod tests {
             snapshots: Mutex::new(vec![healthy]),
             last: dropped,
         };
-        tick(&state, &view, &on_settings()).await;
-        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
         let alert = state.read().await.health_at(0).alert.clone()
             .expect("reputation alert raised");
         assert!(alert.contains("reputation"), "alert was: {alert}");
         // A third (now-stable) tick must not clear it — it latches until the
         // operator acknowledges.
-        tick(&state, &view, &on_settings()).await;
+        tick(&state, &view, &on_settings(), &NoBids).await;
         assert!(
             state.read().await.health_at(0).alert.is_some(),
             "alert latches across healthy ticks"
@@ -394,7 +502,7 @@ mod tests {
             snapshot: biddable_snapshot(),
             fail: true,
         };
-        let out = tick(&state, &view, &on_settings()).await;
+        let out = tick(&state, &view, &on_settings(), &NoBids).await;
         assert_eq!(out, TickOutcome::RefreshError);
         let h = state.read().await.health_at(0);
         assert_eq!(h.state.as_str(), "idle");
@@ -430,6 +538,7 @@ mod tests {
             &view,
             &sender,
             &crate::execution::NoExecutor,
+            &NoBids,
             &on_settings(),
             heartbeat::HEARTBEAT_INTERVAL,
             Some(3),
