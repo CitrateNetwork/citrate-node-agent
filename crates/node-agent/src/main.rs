@@ -120,13 +120,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Clock → schedule context (UTC for S1).
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let (hour, weekday) = clock::utc_hour_and_weekday(now);
+    let (hour, minute, weekday) = clock::utc_hour_min_weekday(now);
     println!("clock (UTC): hour={hour} weekday={weekday:?}");
 
     let bid_settings = Settings {
         enabled: settings.enabled,
         schedule: settings.schedule,
         current_hour: hour,
+        current_min: minute,
         current_day: weekday,
     };
 
@@ -248,11 +249,12 @@ async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::
         .map_err(|e| format!("reading {config_path}: {e}"))?;
     let settings = ComputeSettings::from_json(&raw)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let (hour, weekday) = clock::utc_hour_and_weekday(now);
+    let (hour, minute, weekday) = clock::utc_hour_min_weekday(now);
     let bid_settings = Settings {
         enabled: settings.enabled,
         schedule: settings.schedule,
         current_hour: hour,
+        current_min: minute,
         current_day: weekday,
     };
 

@@ -246,6 +246,7 @@ mod tests {
             enabled: true,
             schedule: Schedule::Always,
             current_hour: 12,
+            current_min: 0,
             current_day: Weekday::Wed,
         }
     }

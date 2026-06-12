@@ -66,6 +66,45 @@ impl Schedule {
             Schedule::Weekends => matches!(day, Weekday::Sat | Weekday::Sun),
         }
     }
+
+    /// Seconds until the current schedule window closes, from `hour:minute`
+    /// on `day` (SELL-S3 pause-before-close).
+    ///
+    /// - `Always` never closes → `u64::MAX`.
+    /// - Outside the window (or a malformed minute) → `0` — nothing can be
+    ///   finished in a window we are not in; the safe answer for a
+    ///   misordered caller.
+    /// - Granularity is one minute, rounding the remaining time DOWN (may
+    ///   under-report by up to 59 s — conservative for an anti-slash margin,
+    ///   never optimistic).
+    pub fn secs_until_window_close(self, hour: u8, minute: u8, day: Weekday) -> u64 {
+        if !self.in_window(hour, day) || minute > 59 {
+            return 0;
+        }
+        let minutes_since_midnight = u64::from(hour) * 60 + u64::from(minute);
+        let remaining_minutes = match self {
+            Schedule::Always => return u64::MAX,
+            Schedule::Nights => {
+                // Window closes at 06:00 (NIGHT_END_HOUR 5 is the last
+                // in-window hour). The evening side wraps midnight.
+                let close = (u64::from(Self::NIGHT_END_HOUR) + 1) * 60;
+                if hour >= Self::NIGHT_START_HOUR {
+                    (24 * 60 - minutes_since_midnight) + close
+                } else {
+                    close - minutes_since_midnight
+                }
+            }
+            Schedule::Weekends => {
+                // Window closes Monday 00:00.
+                let full_days_left: u64 = match day {
+                    Weekday::Sat => 1,
+                    _ => 0, // Sun (weekdays already returned 0 above)
+                };
+                full_days_left * 24 * 60 + (24 * 60 - minutes_since_midnight)
+            }
+        };
+        remaining_minutes * 60
+    }
 }
 
 /// Parsed `compute.json`.
@@ -183,6 +222,75 @@ mod tests {
             ComputeSettings::from_json("not json"),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    // ---- SELL-S3 pause-before-close: secs_until_window_close ----
+
+    #[test]
+    fn always_never_closes() {
+        assert_eq!(
+            Schedule::Always.secs_until_window_close(12, 30, Weekday::Wed),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn nights_window_close_is_six_am() {
+        // 05:00 → one hour left.
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(5, 0, Weekday::Wed),
+            3600
+        );
+        // 05:30 → thirty minutes left.
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(5, 30, Weekday::Wed),
+            1800
+        );
+        // 22:00 (evening side, wraps midnight) → 8 hours left.
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(22, 0, Weekday::Wed),
+            8 * 3600
+        );
+        // 23:15 → 6h45m left.
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(23, 15, Weekday::Wed),
+            6 * 3600 + 45 * 60
+        );
+    }
+
+    #[test]
+    fn nights_outside_window_closes_now() {
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(12, 0, Weekday::Wed),
+            0
+        );
+    }
+
+    #[test]
+    fn weekends_close_monday_midnight() {
+        // Saturday 00:00 → 48h left.
+        assert_eq!(
+            Schedule::Weekends.secs_until_window_close(0, 0, Weekday::Sat),
+            48 * 3600
+        );
+        // Sunday 23:00 → one hour left.
+        assert_eq!(
+            Schedule::Weekends.secs_until_window_close(23, 0, Weekday::Sun),
+            3600
+        );
+        // Tuesday → not in window.
+        assert_eq!(
+            Schedule::Weekends.secs_until_window_close(10, 0, Weekday::Tue),
+            0
+        );
+    }
+
+    #[test]
+    fn malformed_minute_closes_now() {
+        assert_eq!(
+            Schedule::Nights.secs_until_window_close(5, 75, Weekday::Wed),
+            0
+        );
     }
 
     #[test]

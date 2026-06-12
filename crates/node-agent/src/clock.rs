@@ -12,8 +12,16 @@ use config::Weekday;
 
 /// `(hour, weekday)` in UTC for a given UNIX timestamp (seconds since epoch).
 pub fn utc_hour_and_weekday(unix_secs: u64) -> (u8, Weekday) {
+    let (hour, _, weekday) = utc_hour_min_weekday(unix_secs);
+    (hour, weekday)
+}
+
+/// `(hour, minute, weekday)` in UTC — the minute feeds the SELL-S3
+/// pause-before-close window margin.
+pub fn utc_hour_min_weekday(unix_secs: u64) -> (u8, u8, Weekday) {
     let secs_of_day = unix_secs % 86_400;
     let hour = (secs_of_day / 3600) as u8;
+    let minute = ((secs_of_day % 3600) / 60) as u8;
 
     let days = (unix_secs / 86_400) as i64;
     // 1970-01-01 (epoch day 0) was a Thursday.
@@ -29,7 +37,7 @@ pub fn utc_hour_and_weekday(unix_secs: u64) -> (u8, Weekday) {
         6 => Weekday::Wed,
         _ => unreachable!(),
     };
-    (hour, weekday)
+    (hour, minute, weekday)
 }
 
 #[cfg(test)]
@@ -41,6 +49,14 @@ mod tests {
         let (hour, day) = utc_hour_and_weekday(0);
         assert_eq!(hour, 0);
         assert_eq!(day, Weekday::Thu);
+    }
+
+    #[test]
+    fn computes_minute_of_hour() {
+        // 13:42:30 UTC on epoch day.
+        let (hour, minute, _) = utc_hour_min_weekday(13 * 3600 + 42 * 60 + 30);
+        assert_eq!(hour, 13);
+        assert_eq!(minute, 42);
     }
 
     #[test]

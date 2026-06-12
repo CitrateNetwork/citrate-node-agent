@@ -111,6 +111,9 @@ pub struct Settings {
     pub schedule: Schedule,
     /// Current local hour, 0..=23 (sampled by the caller).
     pub current_hour: u8,
+    /// Current local minute, 0..=59 (sampled by the caller; SELL-S3
+    /// pause-before-close margin).
+    pub current_min: u8,
     /// Current local weekday (sampled by the caller).
     pub current_day: Weekday,
 }
@@ -140,6 +143,9 @@ pub enum SkipReason {
     AtCapacity,
     /// Not enough time to finish before the execution deadline.
     DeadlineInfeasible,
+    /// The schedule window closes too soon to finish safely (SELL-S3
+    /// pause-before-close).
+    WindowClosingSoon,
     /// The pricing oracle is stale — refuse to price a bid off bad data.
     OracleStale,
     /// Cost-plus bid exceeds the price cap / there is no profitable price.
@@ -157,6 +163,7 @@ impl SkipReason {
             SkipReason::UnsupportedTier => "job requests a tier other than Commitment",
             SkipReason::AtCapacity => "provider at or above 80% of max concurrent jobs",
             SkipReason::DeadlineInfeasible => "execution deadline too close to finish safely",
+            SkipReason::WindowClosingSoon => "schedule window closes too soon to finish safely",
             SkipReason::OracleStale => "ComputePricingOracle price is stale",
             SkipReason::Unprofitable => "no profitable bid under the price cap",
         }
@@ -200,6 +207,7 @@ impl BidDecision {
 ///       (and any non-Commitment tier)    → Skip(UnsupportedTier)
 ///   (d) active jobs >= 80% capacity      → Skip(AtCapacity)
 ///   (e) deadline < 2× exec time          → Skip(DeadlineInfeasible)
+///   (e2) window closes < 2× exec time    → Skip(WindowClosingSoon)
 ///   (f) cost-plus price, capped at 90%   → Bid (or Skip if unprofitable/stale)
 pub fn evaluate(
     job: &Job,
@@ -249,6 +257,19 @@ pub fn evaluate(
     let required = (job.estimated_exec_secs as u128) * (DEADLINE_SAFETY_FACTOR as u128);
     if (job.secs_until_deadline as u128) < required {
         return skip(SkipReason::DeadlineInfeasible);
+    }
+
+    // (e2) SELL-S3 pause-before-close: the same 2× margin must also fit
+    // inside the schedule window. A nights-only machine at 05:50 must not
+    // take a 10-minute job — finishing outside the window is how unattended
+    // operators get slashed.
+    let window_secs = settings.schedule.secs_until_window_close(
+        settings.current_hour,
+        settings.current_min,
+        settings.current_day,
+    );
+    if (window_secs as u128) < required {
+        return skip(SkipReason::WindowClosingSoon);
     }
 
     // (f) cost-plus pricing off the oracle.
@@ -305,6 +326,7 @@ mod tests {
             enabled: true,
             schedule: Schedule::Always,
             current_hour: 12,
+            current_min: 0,
             current_day: Weekday::Wed,
         }
     }
@@ -332,6 +354,7 @@ mod tests {
             enabled: true,
             schedule: Schedule::Nights,
             current_hour: 12,
+            current_min: 0,
             current_day: Weekday::Tue,
         };
         let d = evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps());
@@ -344,10 +367,80 @@ mod tests {
             enabled: true,
             schedule: Schedule::Nights,
             current_hour: 23,
+            current_min: 0,
             current_day: Weekday::Tue,
         };
         let d = evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps());
         assert!(d.is_bid());
+    }
+
+    // ---- SELL-S3 pause-before-close (window-close margin) ----
+
+    /// A nights-only machine at 05:50 must not take a job needing 2×600s of
+    /// margin — only 600s of window remain (planset BDD: "approaching
+    /// schedule-window close → the agent refuses").
+    #[test]
+    fn nights_at_0550_refuses_job_that_cannot_finish_in_window() {
+        let s = Settings {
+            enabled: true,
+            schedule: Schedule::Nights,
+            current_hour: 5,
+            current_min: 50,
+            current_day: Weekday::Tue,
+        };
+        let d = evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps());
+        assert_eq!(
+            d,
+            BidDecision::Skip {
+                job_id: ok_job().id,
+                reason: SkipReason::WindowClosingSoon
+            }
+        );
+        assert_eq!(
+            SkipReason::WindowClosingSoon.as_str(),
+            "schedule window closes too soon to finish safely"
+        );
+    }
+
+    /// At 05:00 the same job fits (3600s window ≥ 2×600s) — still bids.
+    #[test]
+    fn nights_at_0500_still_bids_with_margin() {
+        let s = Settings {
+            enabled: true,
+            schedule: Schedule::Nights,
+            current_hour: 5,
+            current_min: 0,
+            current_day: Weekday::Tue,
+        };
+        assert!(evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps()).is_bid());
+    }
+
+    /// Exactly 2× margin at the window boundary is allowed (mirrors the
+    /// deadline gate's boundary semantics).
+    #[test]
+    fn exactly_2x_window_margin_is_allowed() {
+        // ok_job needs 1200s; at 05:40 the nights window has exactly 1200s.
+        let s = Settings {
+            enabled: true,
+            schedule: Schedule::Nights,
+            current_hour: 5,
+            current_min: 40,
+            current_day: Weekday::Tue,
+        };
+        assert!(evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps()).is_bid());
+    }
+
+    /// `Always` never trips the window-close gate.
+    #[test]
+    fn always_schedule_never_window_blocks() {
+        let s = Settings {
+            enabled: true,
+            schedule: Schedule::Always,
+            current_hour: 23,
+            current_min: 59,
+            current_day: Weekday::Sun,
+        };
+        assert!(evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps()).is_bid());
     }
 
     #[test]
@@ -356,6 +449,7 @@ mod tests {
             enabled: true,
             schedule: Schedule::Weekends,
             current_hour: 12,
+            current_min: 0,
             current_day: Weekday::Mon,
         };
         let d = evaluate(&ok_job(), &fresh_oracle(), &s, &roomy_caps());
