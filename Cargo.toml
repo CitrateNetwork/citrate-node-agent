@@ -8,6 +8,7 @@ members = [
     "crates/lifecycle",
     "crates/executor",
     "crates/earnings",
+    "crates/pinning",
     "crates/supervision",
     "crates/node-agent",
 ]
