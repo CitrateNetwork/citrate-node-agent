@@ -7,13 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 # Pure decision logic over chainio's decoded pin/slot state + calldata builders,
-# plus the async `PinSigner` seam (a relay/gui-native surface implements it; the
-# default `RecordingPinSigner` records requests so the planner is fully
-# offline-testable) and the `Sealer` seam (the real reduced-circuit prover is a
-# sidecar — see lib.rs; the test `FakeSealer` is behind cfg(test)). tokio is
-# dev-only, for the async-signer/sealer tests.
+# plus the async `PinSigner` seam, the `Sealer` seam, and the `SidecarSealer`
+# adapter that drives the out-of-process `citrate-sealer` binary over its JSON
+# protocol (tokio::process), and the `runloop` that wires planner+sealer+signer.
 [dependencies]
 chainio = { path = "../chainio" }
+tokio = { workspace = true, features = ["process", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
+tiny-keccak = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
