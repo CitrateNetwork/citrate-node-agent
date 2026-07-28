@@ -1,0 +1,53 @@
+name: address-drift
+
+# Blocking CL-C2 gate: fails CI if this repo's vendored 40204 address book drifts
+# from the canonical citrate-chain source of truth. After a re-roll, this goes red
+# until the repo re-syncs — the control that was missing when the 2026-07-27 reroll
+# silently shipped dead addresses across the federation.
+#
+# Requires the org secret CITRATE_CHAIN_READ_TOKEN: a read-only token with access to
+# CitrateNetwork/citrate-chain (already used by citrate-core CI). Once
+# @citratelabs/chain-config is published, this can be simplified to
+# `npx @citratelabs/chain-config check <file>` with no cross-repo checkout.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'crates/chainio/src/generated/addresses.json'
+      - '.github/workflows/address-drift.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: address-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: consumer
+      - name: Checkout canonical citrate-chain (sparse)
+        uses: actions/checkout@v4
+        with:
+          repository: CitrateNetwork/citrate-chain
+          ref: main
+          token: ${{ secrets.CITRATE_CHAIN_READ_TOKEN }}
+          path: citrate-chain
+          sparse-checkout: |
+            contracts/addresses
+            packages/chain-config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Address drift check (blocking)
+        run: |
+          node citrate-chain/packages/chain-config/bin/check.mjs \
+            check "consumer/crates/chainio/src/generated/addresses.json" \
+            --canonical citrate-chain/contracts/addresses/40204.json
