@@ -454,6 +454,21 @@ fn build_job_executor(
         ),
         None => None,
     };
+    // NA-B-005: the resident llama-server is started independently of
+    // provisioning, so bind the adapter to the `modelHash` the operator declares
+    // it serves (`CITRATE_RESIDENT_MODEL_HASH`, same 64-hex format as
+    // CITRATE_MODEL_SHA256). When set, a job for any other model is refused
+    // rather than served under a Commitment the buyer settled for a different
+    // model. When unset, single-model behavior is unchanged.
+    let inference = match std::env::var("CITRATE_RESIDENT_MODEL_HASH").ok() {
+        Some(h) => {
+            let resident = parse_sha256_hex(&h)
+                .ok_or("CITRATE_RESIDENT_MODEL_HASH must be 64 hex chars (optional 0x prefix)")?;
+            executor::LlamaServerInference::with_resident_model(llama, resident)?
+        }
+        None => executor::LlamaServerInference::new(llama)?, // FUA-NODE-AGENT-06
+    };
+
     let nonce = live::random_nonce()?;
 
     Ok(Some(execution::JobExecutor {
@@ -474,7 +489,7 @@ fn build_job_executor(
             dir: input_dir.into(),
         },
         weights: executor::IpfsGatewaySource::new(gateway)?, // FUA-NODE-AGENT-06
-        inference: executor::LlamaServerInference::new(llama)?, // FUA-NODE-AGENT-06
+        inference,
         signer,
         profiler,
         progress: tokio::sync::Mutex::new(execution::JobProgress::default()),
