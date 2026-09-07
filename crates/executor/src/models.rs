@@ -380,7 +380,10 @@ impl IpfsGatewaySource {
             .unwrap_or(DEFAULT_MAX_WEIGHT_BYTES);
         Ok(Self {
             gateway,
-            client: reqwest::Client::new(),
+            // NA-B-001: a per-read (inactivity) timeout — a gateway that stalls
+            // mid-transfer must error, without capping a legitimate multi-GB
+            // weight download the way a total-request timeout would.
+            client: chainio::outbound::streaming_http_client(),
             max_bytes,
         })
     }

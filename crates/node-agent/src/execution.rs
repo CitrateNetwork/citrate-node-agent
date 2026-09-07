@@ -76,6 +76,26 @@ pub struct JobContext {
     pub cache_dir: PathBuf,
 }
 
+/// Default hard ceiling on a single off-chain job input (32 MiB). Overridable
+/// via `CITRATE_MAX_JOB_INPUT_BYTES`. NA-B-003: the requester delivers the job
+/// input off-chain *after* the bid is won, so the deadline-feasibility gate that
+/// `bidder` exists for never saw it. An unbounded input (a multi-GB "prompt")
+/// both OOMs the daemon on read and blows the execution deadline — the on-chain
+/// timeout slash. Mirrors [`executor::DEFAULT_MAX_WEIGHT_BYTES`] for the other
+/// untrusted byte stream.
+pub const DEFAULT_MAX_JOB_INPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The configured per-job input ceiling (env `CITRATE_MAX_JOB_INPUT_BYTES`,
+/// else [`DEFAULT_MAX_JOB_INPUT_BYTES`]). A value that a bid could not have
+/// accounted for is refused rather than run into a slash.
+pub fn max_job_input_bytes() -> u64 {
+    std::env::var("CITRATE_MAX_JOB_INPUT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_JOB_INPUT_BYTES)
+}
+
 /// What one [`drive_job`] step did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
@@ -91,6 +111,11 @@ pub enum StepOutcome {
     /// (`Job.inputHash` is only a hash; the requester delivers the data
     /// off-chain). Hold and retry next tick.
     AwaitingInput,
+    /// NA-B-003: the delivered off-chain input is larger than
+    /// [`max_job_input_bytes`], so it cannot be the bounded workload the bid was
+    /// priced/timed for — refuse it *before* running inference rather than
+    /// execute into a certain deadline miss. The in-flight slot is released.
+    InfeasibleInput { len: u64, max: u64 },
     /// Job can't proceed (deadline/failed/expired/disputed/not-ours).
     Aborted(AbortReason),
     /// Provisioning / inference / signing errored this step (recorded, retryable).
@@ -131,6 +156,24 @@ where
     match action {
         LifecycleAction::RunInference => {
             state.write().await.set_active_jobs(1);
+            // NA-B-003: feasibility gate on the off-chain input. It arrives after
+            // the bid, so this is the first point the daemon can weigh it. An
+            // input beyond the configured ceiling is not the workload the bid was
+            // priced/timed for; running it is a guaranteed deadline miss (the
+            // on-chain timeout slash). Refuse it here, release the slot, and
+            // surface why — do not read/copy/execute it.
+            let max = max_job_input_bytes();
+            let len = ctx.input.len() as u64;
+            if len > max {
+                let mut w = state.write().await;
+                w.set_active_jobs(0);
+                w.set_last_error(Some(format!(
+                    "job {} input {len} bytes exceeds CITRATE_MAX_JOB_INPUT_BYTES {max}; \
+                     refusing to execute an infeasible workload (NA-B-003)",
+                    ctx.job.id
+                )));
+                return StepOutcome::InfeasibleInput { len, max };
+            }
             // SECREM-01 SVC-7 (pre-audit 2026-06-09): the CID comes from chain
             // (ModelRegistry.getModel) and is interpolated into an IPFS gateway
             // URL (`{gateway}/ipfs/{cid}`) deep inside the executor. Validate it
@@ -630,6 +673,39 @@ mod tests {
             result_req.calldata,
             chainio::marketplace::encode_submit_result(7, &art.output_hash, &art.proof)
         );
+    }
+
+    // NA-B-003 tripwire: the deadline-feasibility gate (the reason `bidder`
+    // exists) is blind to the requester-delivered input — the input arrives
+    // after the bid and is executed with no bound. `drive_job` must refuse to
+    // run inference on an input too large to be the profiled workload, rather
+    // than running it and blowing the execution deadline (the on-chain slash).
+    #[tokio::test]
+    async fn oversized_input_is_refused_before_running_inference() {
+        std::env::set_var("CITRATE_MAX_JOB_INPUT_BYTES", "1024");
+        let state = shared();
+        let signer = UnsignedJobSigner::new();
+        let mut progress = JobProgress::default();
+        let mut c = ctx(JobState::Executing, "feasibility");
+        c.input = vec![0u8; 4096]; // 4 KiB delivered prompt, over the 1 KiB cap
+
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, [0u8; 32], None).await;
+
+        // On the pinned code this runs inference and produces artifacts (RED).
+        assert_ne!(
+            o,
+            StepOutcome::RanInference,
+            "NA-B-003 REPRODUCED: oversized input ran inference instead of being refused"
+        );
+        assert!(
+            progress.artifacts.is_none(),
+            "no proof artifacts must be built for an infeasible input"
+        );
+        // The in-flight slot is released and the reason is surfaced.
+        assert_eq!(state.read().await.health_at(0).active_jobs, 0);
+        assert!(signer.recorded().is_empty());
+
+        std::env::remove_var("CITRATE_MAX_JOB_INPUT_BYTES");
     }
 
     #[tokio::test]

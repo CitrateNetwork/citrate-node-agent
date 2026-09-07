@@ -27,6 +27,78 @@
 /// Documented dev-only; never set this in production.
 pub const ALLOW_INSECURE_ENV: &str = "CITRATE_NODE_AGENT_ALLOW_INSECURE_OUTBOUND";
 
+// ── liveness timeouts (NA-B-001) ────────────────────────────────────────────
+//
+// None of the agent's three outbound clients set any timeout, so a single
+// endpoint that accepts a connection and then goes silent (a wedged RPC/Kubo
+// node, an on-path attacker who stalls rather than tampers, a hung GPU box)
+// parks the awaiting future forever. In the supervised daemon that starves the
+// heartbeat the provider is suspended/slashed for missing — a silent DoS. Every
+// client is built through the helpers below so no bare `reqwest::Client::new()`
+// (which is timeout-less) survives.
+
+/// Total-request timeout, seconds, for small-response clients (RPC, inference).
+/// Overridable via `CITRATE_HTTP_TIMEOUT_SECS`.
+pub const HTTP_TIMEOUT_ENV: &str = "CITRATE_HTTP_TIMEOUT_SECS";
+/// TCP+TLS connect timeout, seconds, for every outbound client.
+/// Overridable via `CITRATE_HTTP_CONNECT_TIMEOUT_SECS`.
+pub const HTTP_CONNECT_TIMEOUT_ENV: &str = "CITRATE_HTTP_CONNECT_TIMEOUT_SECS";
+/// Per-read inactivity timeout, seconds, for streaming clients (the weight
+/// fetch, whose body can be gigabytes — a *total* timeout would break a legit
+/// large download, so liveness is bounded by silence-between-reads instead).
+/// Overridable via `CITRATE_HTTP_READ_TIMEOUT_SECS`.
+pub const HTTP_READ_TIMEOUT_ENV: &str = "CITRATE_HTTP_READ_TIMEOUT_SECS";
+
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_HTTP_READ_TIMEOUT_SECS: u64 = 60;
+
+fn secs_from_env(var: &str, default: u64) -> std::time::Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Build a reqwest client with connect + total-request timeouts, for clients
+/// whose responses are small and bounded (the JSON-RPC read client and the
+/// inference adapter). A stalled endpoint now yields a timeout `Err` instead of
+/// an unresolvable future.
+///
+/// If the TLS backend itself fails to initialize the builder falls back to
+/// `reqwest::Client::new()` — the same construction the pinned code used
+/// unconditionally, so this is never worse and adds no new panic (Rule 5).
+pub fn timed_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(secs_from_env(
+            HTTP_CONNECT_TIMEOUT_ENV,
+            DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(secs_from_env(HTTP_TIMEOUT_ENV, DEFAULT_HTTP_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Build a reqwest client with connect + per-read (inactivity) timeouts, for the
+/// large-body weight fetch. Bounds liveness (a gateway that stops sending mid
+/// body now errors) without capping the total time a legitimate multi-GB
+/// download may take. Same fail-safe fallback as [`timed_http_client`].
+pub fn streaming_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(secs_from_env(
+            HTTP_CONNECT_TIMEOUT_ENV,
+            DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .read_timeout(secs_from_env(
+            HTTP_READ_TIMEOUT_ENV,
+            DEFAULT_HTTP_READ_TIMEOUT_SECS,
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Why an outbound endpoint URL was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundUrlError {
