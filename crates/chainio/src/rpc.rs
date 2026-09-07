@@ -125,7 +125,10 @@ impl RpcClient {
         crate::outbound::validate_outbound_url(&url)?;
         Ok(RpcClient {
             url,
-            http: reqwest::Client::new(),
+            // NA-B-001: a timeout-configured client — a stalled RPC endpoint must
+            // yield a timeout Err, never park the daemon tick (and the heartbeat
+            // it starves) forever.
+            http: crate::outbound::timed_http_client(),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }

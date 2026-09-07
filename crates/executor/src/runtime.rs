@@ -73,7 +73,10 @@ impl LlamaServerInference {
         chainio::outbound::validate_outbound_url(&base_url)?;
         Ok(Self {
             base_url,
-            client: reqwest::Client::new(),
+            // NA-B-001/003: a timeout-configured client — a stalled inference
+            // backend must error, never park `run()` past the job's execution
+            // deadline (the on-chain timeout slash).
+            client: chainio::outbound::timed_http_client(),
         })
     }
 }
