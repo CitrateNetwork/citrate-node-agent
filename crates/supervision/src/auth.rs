@@ -82,8 +82,17 @@ impl SupervisionAuth {
     /// `0700` on Unix (see the module-level threat model): the token's only
     /// protection is filesystem permissions, so we repair them on every run.
     pub fn load_or_create(path: &Path) -> std::io::Result<Self> {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            let trimmed = contents.trim();
+        // NA-B-007: before trusting a pre-existing token file, refuse to adopt it
+        // through a symlink or from an inode we do not own. The module's whole
+        // threat model is "security rests on filesystem permissions", but the old
+        // path read + `chmod 0600` + `write` all followed symlinks and never
+        // checked ownership — so a party who could pre-create the token path (a
+        // shared/misconfigured dir, or an operator-supplied
+        // `CITRATE_NODE_AGENT_TOKEN_FILE`) could either fix the supervision token
+        // or redirect the hardening/write onto an arbitrary file owned by the
+        // daemon user.
+        if let Some(existing) = read_existing_token(path)? {
+            let trimmed = existing.trim();
             if !trimmed.is_empty() {
                 let auth = Self::from_token(trimmed);
                 if let Some(parent) = path.parent() {
@@ -92,16 +101,114 @@ impl SupervisionAuth {
                 harden_perms(path)?;
                 return Ok(auth);
             }
+            // A present-but-empty token file is an anomaly; on Unix we refuse to
+            // overwrite it in place (it may be a symlink target / foreign inode)
+            // and fail closed rather than silently replace it.
+            #[cfg(unix)]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "supervision token file {} exists but is empty; refusing to overwrite in place",
+                    path.display()
+                ),
+            ));
         }
         let auth = Self::generate();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             harden_dir_perms(parent)?;
         }
-        std::fs::write(path, auth.token())?;
+        create_new_token_file(path, auth.token())?;
         harden_perms(path)?;
         Ok(auth)
     }
+}
+
+/// Read a pre-existing token, fail-closed on a symlink or foreign-owned inode.
+///
+/// Returns `Ok(None)` when the path does not exist (the create branch takes
+/// over), `Ok(Some(contents))` when a safe regular file is present, and `Err`
+/// when the inode is a symlink or is owned by another uid (NA-B-007). On
+/// non-Unix targets there is no symlink/uid concept here, so it simply reads.
+#[cfg(unix)]
+fn read_existing_token(path: &Path) -> std::io::Result<Option<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "supervision token path {} is a symlink; refusing to follow it (NA-B-007)",
+                path.display()
+            ),
+        ));
+    }
+    // Trust only an inode we own. `geteuid` is the daemon's effective uid.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "supervision token file {} is owned by uid {} not {}; refusing to adopt it (NA-B-007)",
+                path.display(),
+                meta.uid(),
+                euid
+            ),
+        ));
+    }
+    // Open with O_NOFOLLOW so a swap-to-symlink after the stat is also refused.
+    match open_no_follow(path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            let mut s = String::new();
+            f.read_to_string(&mut s)?;
+            Ok(Some(s))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn read_existing_token(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Create the token file, failing if anything already exists at the path
+/// (`create_new`) and never following a symlink (`O_NOFOLLOW`), with `0600` from
+/// the moment of creation so there is no window at the default umask (NA-B-007).
+#[cfg(unix)]
+fn create_new_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(token.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn create_new_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    std::fs::write(path, token)
 }
 
 /// Resolve the token-file path: `CITRATE_NODE_AGENT_TOKEN_FILE` if set, else
@@ -254,5 +361,79 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
+    }
+
+    /// NA-B-007: a symlink at the token path must be refused, not followed —
+    /// adopting the target's contents would let a pre-planter fix the token, and
+    /// the subsequent `chmod 0600` / write would land on an arbitrary file owned
+    /// by the daemon user.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_refuses_a_symlinked_token_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "citrate-superv-auth-symlink-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A victim file the attacker wants chmod'd/overwritten, with contents an
+        // attacker would want adopted as the token.
+        let victim = dir.join("victim.secret");
+        std::fs::write(&victim, "attacker-chosen-token-0000").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // The token path is a symlink to the victim.
+        let token_path = dir.join("supervision.token");
+        std::os::unix::fs::symlink(&victim, &token_path).unwrap();
+
+        let err = match SupervisionAuth::load_or_create(&token_path) {
+            Ok(_) => panic!("expected load_or_create to refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::InvalidData),
+            "symlinked token path must be refused, got {err:?}"
+        );
+        // The victim was neither adopted nor hardened/overwritten.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "attacker-chosen-token-0000");
+        let vmode = std::fs::metadata(&victim).unwrap().permissions().mode();
+        assert_eq!(vmode & 0o777, 0o644, "victim perms untouched (no chmod-through-symlink)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NA-B-007: the create path uses `create_new` + `O_NOFOLLOW`, so a symlink
+    /// pre-planted where the token would be created is a hard error (the write
+    /// cannot be redirected onto the symlink target).
+    #[cfg(unix)]
+    #[test]
+    fn create_refuses_to_write_through_a_pre_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "citrate-superv-auth-createlink-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("redirect.target"); // does not exist yet
+        let token_path = dir.join("supervision.token");
+        std::os::unix::fs::symlink(&target, &token_path).unwrap();
+
+        let err = match SupervisionAuth::load_or_create(&token_path) {
+            Ok(_) => panic!("expected load_or_create to refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::AlreadyExists
+            ),
+            "a pre-planted symlink at the create path must be refused, got {err:?}"
+        );
+        // Nothing was written to the redirect target.
+        assert!(!target.exists(), "O_NOFOLLOW/create_new must not create the symlink target");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

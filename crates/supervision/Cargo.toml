@@ -15,6 +15,10 @@ axum = { version = "0.7", default-features = false, features = ["tokio", "http1"
 # getrandom for the CSPRNG token, subtle for the constant-time compare.
 getrandom = "0.2"
 subtle = "2"
+# NA-B-007: O_NOFOLLOW + geteuid() so the token file is never adopted through a
+# symlink or from a foreign-owned inode (already in the tree via getrandom).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # A tiny HTTP client to exercise the live server over an ephemeral TCP port in
