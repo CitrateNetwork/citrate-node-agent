@@ -104,18 +104,55 @@ impl core::fmt::Display for TickError {
     }
 }
 
+/// Read-side seam for the locally-held replica bytes of one (cid, sector).
+///
+/// NA-B-002: the seal MUST be bound to the bytes the node actually stores. This
+/// returns the pinner's local replica for the CID/sector; an `Err` (or empty
+/// bytes) means "no replica present", which makes [`seal_inputs`] refuse to
+/// build a seal — the daemon can never post a bond behind a proof of nothing.
+/// The concrete production source (the local content store / verified fetch) is
+/// the wiring follow-up; the point closed here is that content is *required*.
+pub trait ReplicaSource {
+    fn replica(
+        &self,
+        cid: [u8; 32],
+        sector: u128,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ViewError>> + Send;
+}
+
 /// Derive the reduced circuit's `SealInputs` for one (cid, sector),
 /// DETERMINISTICALLY — so the daemon reproduces the exact same seal at PoSt time
 /// without reading any per-seal state back from the chain (getPin doesn't expose
 /// epoch/data). The pinner identity is the node's address (the private pre-image
-/// of replicaID); `epoch` and the 4 reduced content elements are keccak-derived
-/// from (cid, sector). The content is a testnet-functional stand-in for the real
-/// model bytes — real-size sealing is PIN-P1 f.6.
-pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
+/// of replicaID); `epoch` is keccak-derived from (cid, sector).
+///
+/// NA-B-002: the 4 reduced content elements are derived from the actual stored
+/// `replica` bytes (not from the public (cid, sector) pair), so a pinner storing
+/// nothing — or different bytes — cannot reproduce the honest pinner's public
+/// inputs. Sealing is refused (`Err`) when no replica is present: never bond a
+/// proof of nothing. (Reduced testnet instance; real-size chunk sampling is
+/// PIN-P1 f.6, same content-bound interface.)
+pub fn seal_inputs(
+    cfg: &PinConfig,
+    cid: [u8; 32],
+    sector: u128,
+    replica: &[u8],
+) -> Result<SealInputs, SealerError> {
     use tiny_keccak::Hasher as _;
+    if replica.is_empty() {
+        return Err(SealerError::Replica(format!(
+            "no local replica bytes for cid {} sector {sector}; refusing to seal a \
+             proof not bound to stored content (NA-B-002)",
+            hex::encode(cid)
+        )));
+    }
+
     let mut pinner_identity = [0u8; 32];
     pinner_identity[12..32].copy_from_slice(&cfg.me); // address → field element (left-padded)
 
+    // Content-bound: fold the stored replica bytes into every element. Public
+    // (cid, sector) still salt it (so replicas differ per slot), but the bytes
+    // are load-bearing — the proof attests to possession of *these* bytes.
     let derive = |tag: &[u8], i: u8| -> [u8; 32] {
         let mut k = tiny_keccak::Keccak::v256();
         let mut out = [0u8; 32];
@@ -123,6 +160,7 @@ pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
         k.update(&cid);
         k.update(&sector.to_be_bytes());
         k.update(&[i]);
+        k.update(replica); // NA-B-002: the stored bytes are part of the pre-image
         k.finalize(&mut out);
         out[0] = 0; // keep < 2^248 < BN254 modulus (canonical field element)
         out
@@ -133,26 +171,38 @@ pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
         *slot = derive(b"PIN-reduced-data", i as u8);
     }
     // Deterministic epoch in the low 8 bytes (stable seal↔PoSt; the contract
-    // just echoes whatever epoch was sealed).
-    let e = derive(b"PIN-epoch", 0);
+    // just echoes whatever epoch was sealed). Epoch is an on-chain-echoed value,
+    // not part of the content attestation, so it stays (cid, sector)-derived.
+    let mut ke = tiny_keccak::Keccak::v256();
+    let mut e = [0u8; 32];
+    ke.update(b"PIN-epoch");
+    ke.update(&cid);
+    ke.update(&sector.to_be_bytes());
+    ke.update(&[0]);
+    ke.finalize(&mut e);
     let mut low = [0u8; 8];
     low.copy_from_slice(&e[24..32]);
     let epoch = u64::from_be_bytes(low) as u128;
 
-    SealInputs {
+    Ok(SealInputs {
         pinner_identity,
         cid,
         sector,
         epoch,
         data,
-    }
+    })
 }
 
 /// Advance one (cid, sector) by at most one on-chain write.
-pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner>(
+///
+/// NA-B-002: `replicas` supplies the locally-stored bytes the seal is bound to.
+/// If they are absent, `seal_inputs` refuses and the tick errors — the daemon
+/// never posts a bond behind a proof not bound to stored content.
+pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner, R: ReplicaSource>(
     view: &V,
     sealer: &S,
     signer: &G,
+    replicas: &R,
     cfg: &PinConfig,
     cid: [u8; 32],
     sector: u128,
@@ -187,7 +237,13 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner>(
             Ok(TickOutcome::Requested(intent, obs))
         }
         PinAction::Seal { cid, sector } => {
-            let inputs = seal_inputs(cfg, cid, sector);
+            // NA-B-002: fetch the locally-stored replica and bind the seal to it;
+            // no bytes → no seal → no bond.
+            let bytes = replicas
+                .replica(cid, sector)
+                .await
+                .map_err(|e| TickError::Seal(SealerError::Replica(e.0)))?;
+            let inputs = seal_inputs(cfg, cid, sector, &bytes).map_err(TickError::Seal)?;
             let sealed = sealer.seal(&inputs).await.map_err(TickError::Seal)?;
             let req = seal_commit_request(&input, &sealed, inputs.epoch);
             let obs = signer.request(req).await.map_err(TickError::Sign)?;
@@ -204,7 +260,13 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner>(
             // the committed-nonce index (reduced: CHALLENGE_N == N → indexes a
             // real node). [Re-seal is cheap at reduced size; a real-size daemon
             // caches the original SealArtifacts — follow-up.]
-            let inputs = seal_inputs(cfg, cid, sector);
+            // NA-B-002: re-bind to the same stored bytes so the PoSt answer
+            // attests to possession of content, not of a public (cid, sector).
+            let bytes = replicas
+                .replica(cid, sector)
+                .await
+                .map_err(|e| TickError::Seal(SealerError::Replica(e.0)))?;
+            let inputs = seal_inputs(cfg, cid, sector, &bytes).map_err(TickError::Seal)?;
             let sealed = sealer.seal(&inputs).await.map_err(TickError::Seal)?;
             let challenge_index = nonce_to_index(&nonce, cfg.challenge_n);
             let proof = sealer
@@ -289,6 +351,27 @@ mod tests {
         }
     }
 
+    /// A replica source that always holds bytes for any (cid, sector).
+    struct HasReplica;
+    impl ReplicaSource for HasReplica {
+        async fn replica(&self, cid: [u8; 32], sector: u128) -> Result<Vec<u8>, ViewError> {
+            // Distinct-per-slot stand-in bytes; the point is that *some* stored
+            // content exists and is folded into the seal.
+            let mut b = b"stored-replica:".to_vec();
+            b.extend_from_slice(&cid);
+            b.extend_from_slice(&sector.to_be_bytes());
+            Ok(b)
+        }
+    }
+
+    /// A replica source that stores nothing — the sybil "store zero bytes" case.
+    struct NoReplica;
+    impl ReplicaSource for NoReplica {
+        async fn replica(&self, _cid: [u8; 32], _sector: u128) -> Result<Vec<u8>, ViewError> {
+            Ok(Vec::new())
+        }
+    }
+
     struct FakeSealer;
     impl Sealer for FakeSealer {
         async fn seal(&self, inputs: &SealInputs) -> Result<SealArtifacts, SealerError> {
@@ -336,7 +419,7 @@ mod tests {
             block: 100,
         };
         let signer = RecordingSigner::default();
-        let out = tick_pin(&view, &FakeSealer, &signer, &cfg(), CID, 0)
+        let out = tick_pin(&view, &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
             .await
             .expect("tick");
         assert!(matches!(
@@ -354,7 +437,7 @@ mod tests {
             block: 100,
         };
         let signer = RecordingSigner::default();
-        let out = tick_pin(&view, &FakeSealer, &signer, &cfg(), CID, 0)
+        let out = tick_pin(&view, &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
             .await
             .expect("tick");
         assert!(matches!(out, TickOutcome::Sealed(_)));
@@ -362,6 +445,26 @@ mod tests {
         assert_eq!(rec.intent, PinIntent::SealCommit);
         assert_eq!(rec.value_wei, 10_000);
         assert_eq!(&rec.calldata[0..4], &chainio::selectors::pin_seal_commit());
+    }
+
+    // NA-B-002: a seal-ready slot with NO locally-stored replica must NOT post a
+    // bond — the daemon errors instead of sealing a proof of nothing.
+    #[tokio::test]
+    async fn tick_refuses_to_seal_without_a_stored_replica() {
+        let view = FakeView {
+            registered: true,
+            pin: none_pin(),
+            slot: slot(true, 9_000, 1),
+            block: 100,
+        };
+        let signer = RecordingSigner::default();
+        let out = tick_pin(&view, &FakeSealer, &signer, &NoReplica, &cfg(), CID, 0).await;
+        assert!(
+            matches!(out, Err(TickError::Seal(SealerError::Replica(_)))),
+            "expected a replica-absent seal refusal, got {out:?}"
+        );
+        // No bonded sealCommit was ever handed to the signer.
+        assert!(signer.last.lock().expect("lock").is_none());
     }
 
     #[tokio::test]
@@ -372,7 +475,7 @@ mod tests {
             slot: slot(true, 9_000, 3),
             block: 100,
         };
-        let out = tick_pin(&view, &FakeSealer, &RecordingSigner::default(), &cfg(), CID, 0)
+        let out = tick_pin(&view, &FakeSealer, &RecordingSigner::default(), &HasReplica, &cfg(), CID, 0)
             .await
             .expect("tick");
         assert_eq!(out, TickOutcome::Hold(HoldReason::SlotAtQuorum));
@@ -386,17 +489,32 @@ mod tests {
         assert_eq!(nonce_to_index(&n, 0), 0);
     }
 
+    // NA-B-002 (RC-8 inversion): the pinned version of this test asserted the
+    // vulnerable property — that `data` is derived from the public (cid, sector)
+    // pair. It now asserts the secure property: `data` is bound to the STORED
+    // replica bytes and sealing is refused without them.
     #[test]
-    fn seal_inputs_deterministic_and_bound() {
-        let a = seal_inputs(&cfg(), CID, 0);
-        let b = seal_inputs(&cfg(), CID, 0);
-        assert_eq!(a, b, "seal inputs must be deterministic (seal↔PoSt reproduce)");
+    fn seal_inputs_deterministic_and_content_bound() {
+        const R: &[u8] = b"the-real-model-weights";
+        let a = seal_inputs(&cfg(), CID, 0, R).expect("replica present");
+        let b = seal_inputs(&cfg(), CID, 0, R).expect("replica present");
+        assert_eq!(
+            a, b,
+            "seal inputs must be deterministic for the same replica (seal↔PoSt reproduce)"
+        );
         assert_eq!(&a.pinner_identity[12..32], &ME);
         // distinct sector → distinct inputs (epoch + data)
-        let c = seal_inputs(&cfg(), CID, 1);
+        let c = seal_inputs(&cfg(), CID, 1, R).expect("replica present");
         assert_ne!(a.epoch, c.epoch);
-        // data is CID/sector-derived + canonical (high byte zeroed)
+        // data is canonical (high byte zeroed) and per-element distinct
         assert!(a.data.iter().all(|d| d[0] == 0));
         assert_ne!(a.data[0], a.data[1]);
+        // CONTENT-BOUND: different stored bytes for the same (cid, sector) yield
+        // different data — a pinner storing nothing/other bytes cannot reproduce
+        // the honest pinner's public inputs (the whole point of the proof).
+        let other = seal_inputs(&cfg(), CID, 0, b"different-bytes-entirely").expect("replica");
+        assert_ne!(a.data, other.data, "seal data must depend on the stored bytes");
+        // No replica → refuse to seal (never bond a proof of nothing).
+        assert!(seal_inputs(&cfg(), CID, 0, b"").is_err());
     }
 }
