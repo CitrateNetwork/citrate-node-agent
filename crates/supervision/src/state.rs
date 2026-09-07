@@ -106,7 +106,24 @@ pub struct PendingSignatureRequest {
     /// The broadcast tx hash once observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
+    /// Stable dedup key for writes whose calldata embeds a **drifting** value
+    /// (NA-B-004): `bidOnJob`'s price/latency change every tick, so exact-calldata
+    /// dedup misses and the queue grows without bound. Writes enqueued via
+    /// [`AgentState::enqueue_superseding_signature_request`] carry a stable
+    /// `(intent, dedup_key)` — normally the job id — so the pending entry is
+    /// superseded in place instead of duplicated. `None` for calldata-dedup
+    /// writes (heartbeat, claimRewards, the one-shot lifecycle writes). Internal
+    /// bookkeeping — never serialized to the signing surface.
+    #[serde(skip)]
+    pub dedup_key: Option<String>,
 }
+
+/// Hard ceiling on the signing-relay queue length (NA-B-004). The queue retains
+/// `submitted` entries so a chain-lag re-emit still dedups, but retention must be
+/// **bounded**: once the queue exceeds this, the oldest already-broadcast
+/// (`submitted`) entries are evicted first. `pending` entries are never evicted —
+/// they are still awaiting the signer.
+pub const MAX_PENDING_REQUESTS: usize = 256;
 
 /// Monotonic-ish wall clock used for heartbeat-age math. Pulled out behind a
 /// function so tests can drive it deterministically.
@@ -313,8 +330,90 @@ impl AgentState {
             expires_block: expires_block.to_string(),
             status: "pending".to_string(),
             tx_hash: None,
+            dedup_key: None,
         });
+        self.evict_if_over_cap();
         id
+    }
+
+    /// Enqueue an unsigned write whose calldata embeds a **drifting** value (the
+    /// oracle price / profiled latency in `bidOnJob`), deduplicated by a stable
+    /// `(intent, dedup_key)` pair instead of by exact calldata.
+    ///
+    /// [`Self::enqueue_signature_request`] dedups on the calldata bytes, which is
+    /// correct for writes whose calldata is stable (heartbeat, claimRewards, the
+    /// one-shot lifecycle writes) but **wrong** for a write whose calldata moves
+    /// every tick: each drift misses the dedup and mints a fresh pending entry,
+    /// so the queue grows without bound and the signing surface is shown many
+    /// competing bids for one job (NA-B-004). This method instead **supersedes**
+    /// the existing *pending* entry in place — same id, latest
+    /// calldata/value/context — so at most one pending write per
+    /// `(intent, dedup_key)` ever exists. A `submitted` entry is left untouched:
+    /// a one-shot write (a bid) must never re-arm once broadcast.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_superseding_signature_request(
+        &mut self,
+        intent: String,
+        dedup_key: String,
+        to: String,
+        calldata: String,
+        value_wei: u128,
+        chain_id: u64,
+        context: String,
+        expires_block: u128,
+    ) -> u64 {
+        if let Some(existing) = self
+            .pending_requests
+            .iter_mut()
+            .find(|r| r.intent == intent && r.dedup_key.as_deref() == Some(dedup_key.as_str()))
+        {
+            if existing.status == "pending" {
+                // Supersede the stale unsigned write with the current calldata.
+                existing.calldata = calldata;
+                existing.value_wei = value_wei.to_string();
+                existing.context = context;
+                existing.expires_block = expires_block.to_string();
+            }
+            // `submitted` → leave as-is (one-shot; never re-arm a broadcast bid).
+            return existing.id;
+        }
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.pending_requests.push(PendingSignatureRequest {
+            id,
+            intent,
+            to,
+            calldata,
+            value_wei: value_wei.to_string(),
+            chain_id,
+            context,
+            expires_block: expires_block.to_string(),
+            status: "pending".to_string(),
+            tx_hash: None,
+            dedup_key: Some(dedup_key),
+        });
+        self.evict_if_over_cap();
+        id
+    }
+
+    /// Bound the signing-relay queue (NA-B-004). Submitted entries are retained
+    /// so a chain-lag re-emit still dedups, but retention is capped at
+    /// [`MAX_PENDING_REQUESTS`]: over the cap, evict the oldest **submitted**
+    /// (already-broadcast, safe-to-forget) entries first, front to back. A
+    /// `pending` entry is never evicted — it is still awaiting the signer.
+    fn evict_if_over_cap(&mut self) {
+        if self.pending_requests.len() <= MAX_PENDING_REQUESTS {
+            return;
+        }
+        let mut overflow = self.pending_requests.len() - MAX_PENDING_REQUESTS;
+        self.pending_requests.retain(|r| {
+            if overflow > 0 && r.status == "submitted" {
+                overflow -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Enqueue a **recurring** unsigned write (the heartbeat). Identical
@@ -696,6 +795,88 @@ mod tests {
         );
         assert_eq!(a, b);
         assert_eq!(s.signature_requests().len(), 1);
+    }
+
+    // NA-B-004: a write whose calldata embeds a drifting value (bidOnJob's
+    // price/latency) must dedup on (intent, dedup_key), superseding the pending
+    // entry in place — never stacking a new one per tick.
+    #[test]
+    fn superseding_enqueue_keeps_one_pending_per_key_across_drift() {
+        let mut s = AgentState::new();
+        let mut first_id = None;
+        for tick in 0..240u128 {
+            // calldata differs every tick (drifting price) but the key is stable.
+            let calldata = format!("0x{:064x}", 1_000 + tick);
+            let id = s.enqueue_superseding_signature_request(
+                "bidOnJob".into(),
+                "7".into(),
+                "0x11".into(),
+                calldata,
+                0,
+                40204,
+                format!("bidOnJob job 7 tick {tick}"),
+                0,
+            );
+            first_id.get_or_insert(id);
+            assert_eq!(id, first_id.unwrap(), "same id every tick (superseded)");
+        }
+        let reqs = s.signature_requests();
+        assert_eq!(reqs.len(), 1, "one pending bid, not 240");
+        assert_eq!(reqs[0].calldata, format!("0x{:064x}", 1_000 + 239));
+
+        // A different job id is a distinct key → its own single entry.
+        s.enqueue_superseding_signature_request(
+            "bidOnJob".into(),
+            "8".into(),
+            "0x11".into(),
+            "0xbeef".into(),
+            0,
+            40204,
+            "bidOnJob job 8".into(),
+            0,
+        );
+        assert_eq!(s.signature_requests().len(), 2);
+
+        // Once observed, a bid must NOT be re-armed by a later supersede.
+        let id7 = first_id.unwrap();
+        s.mark_request_observed(id7, "0xtx".into());
+        s.enqueue_superseding_signature_request(
+            "bidOnJob".into(),
+            "7".into(),
+            "0x11".into(),
+            "0xdead".into(),
+            0,
+            40204,
+            "bidOnJob job 7 late".into(),
+            0,
+        );
+        let r7 = s.signature_requests().into_iter().find(|r| r.id == id7).unwrap();
+        assert_eq!(r7.status, "submitted", "broadcast bid never re-armed");
+        assert_eq!(r7.calldata, format!("0x{:064x}", 1_000 + 239), "submitted calldata frozen");
+    }
+
+    // NA-B-004: the queue is bounded — submitted (already-broadcast) entries are
+    // evicted oldest-first once it exceeds the cap; pending entries are kept.
+    #[test]
+    fn queue_is_bounded_by_evicting_old_submitted_entries() {
+        let mut s = AgentState::new();
+        // Fill past the cap with distinct one-shot writes, marking each observed.
+        for i in 0..(MAX_PENDING_REQUESTS + 50) {
+            let id = s.enqueue_signature_request(
+                "completeJob".into(),
+                "0x11".into(),
+                format!("0x{i:x}"),
+                0,
+                40204,
+                "ctx".into(),
+                0,
+            );
+            s.mark_request_observed(id, "0xtx".into());
+        }
+        assert!(
+            s.signature_requests().len() <= MAX_PENDING_REQUESTS,
+            "queue never grows past the cap"
+        );
     }
 
     #[test]

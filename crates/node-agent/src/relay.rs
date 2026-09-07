@@ -90,12 +90,19 @@ impl heartbeat::HeartbeatSender for RelayHeartbeatSender {
 }
 
 /// Bid placer over the signing relay: a Bid decision enqueues the unsigned
-/// `ComputeMarketplace.bidOnJob(jobId, price, latency)` write. Identical bid
-/// params re-emitted next tick dedup by calldata (one-shot semantics — a bid,
-/// unlike a heartbeat, must never re-arm once broadcast).
+/// `ComputeMarketplace.bidOnJob(jobId, price, latency)` write.
+///
+/// NA-B-004: `bidOnJob` calldata embeds the live oracle price and the profiled
+/// latency, both of which **drift every tick** in normal operation, so plain
+/// dedup-by-calldata (as [`RelaySigner::request`] does) misses on every drift
+/// and mints a fresh pending entry — an unbounded queue of competing bids for
+/// one job. This placer instead enqueues via
+/// [`AgentState::enqueue_superseding_signature_request`] keyed on the job id, so
+/// a moved price **supersedes** the stale unsigned bid in place (at most one
+/// pending bid per job), and a once-broadcast bid is never re-armed.
 #[derive(Clone)]
 pub struct RelayBidPlacer {
-    signer: RelaySigner,
+    state: SharedState,
     /// `ComputeMarketplace` address (canonical chain-40204 book).
     marketplace: chainio::abi::Address,
     chain_id: u64,
@@ -108,7 +115,7 @@ impl RelayBidPlacer {
         chain_id: u64,
     ) -> Self {
         Self {
-            signer: RelaySigner::new(state),
+            state,
             marketplace,
             chain_id,
         }
@@ -122,24 +129,20 @@ impl crate::daemon::BidPlacer for RelayBidPlacer {
         price_wei: u128,
         estimated_latency_ms: u128,
     ) -> Result<(), String> {
-        let req = SignatureRequest {
-            intent: lifecycle::WriteIntent::BidOnJob,
-            to: self.marketplace,
-            calldata: chainio::marketplace::encode_bid_on_job(
-                job_id,
-                price_wei,
-                estimated_latency_ms,
-            ),
-            value_wei: 0,
-            chain_id: self.chain_id,
-            context: format!("bidOnJob job {job_id} at {price_wei} wei"),
-            expires_block: 0,
-        };
-        self.signer
-            .request(req)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let calldata =
+            chainio::marketplace::encode_bid_on_job(job_id, price_wei, estimated_latency_ms);
+        self.state.write().await.enqueue_superseding_signature_request(
+            lifecycle::WriteIntent::BidOnJob.label().to_string(),
+            job_id.to_string(),
+            hex_encode(&self.marketplace),
+            hex_encode(&calldata),
+            0,
+            self.chain_id,
+            format!("bidOnJob job {job_id} at {price_wei} wei"),
+            0,
+        );
+        // Queued for the signing surface — not broadcast here.
+        Ok(())
     }
 }
 
@@ -215,8 +218,15 @@ mod tests {
         assert!(state.read().await.health().heartbeat_age_secs.is_some());
     }
 
+    // RC-8 (NA-B-004): the prior version of this test only re-emitted a
+    // *byte-identical* bid — the one case that does not occur in production,
+    // where the oracle price and profiled latency drift every tick. It is
+    // inverted here to the drifting case: a bid for the same job at a *moved*
+    // price must SUPERSEDE the stale unsigned bid in place, not stack a second
+    // competing entry. Under the old dedup-by-calldata placer this asserted
+    // len()==1 would fail (240 ticks → 240 entries).
     #[tokio::test]
-    async fn bid_placer_enqueues_bid_on_job_once() {
+    async fn bid_placer_supersedes_a_drifting_bid_for_one_job() {
         let state: SharedState = Arc::new(RwLock::new(AgentState::new()));
         let placer = RelayBidPlacer::new(state.clone(), [0x11; 20], 40204);
 
@@ -226,18 +236,28 @@ mod tests {
         assert_eq!(reqs[0].intent, "bidOnJob");
         assert!(reqs[0].calldata.starts_with("0x18360fc2"), "pinned selector");
         assert_eq!(reqs[0].value_wei, "0");
+        let first_calldata = reqs[0].calldata.clone();
+        let first_id = reqs[0].id;
 
-        // Same bid re-emitted next tick → dedup, no duplicate.
-        placer.place(7, 1_150_000, 600_000).await.expect("dedup");
-        assert_eq!(state.read().await.signature_requests().len(), 1);
+        // The price/latency drift every tick. Re-emitting a DIFFERENT bid for the
+        // SAME job supersedes the pending entry in place: still one entry, same
+        // id, but the newest calldata.
+        for tick in 1..=240u128 {
+            placer
+                .place(7, 1_150_000 + tick, 600_000 + tick)
+                .await
+                .expect("supersede");
+        }
+        let reqs = state.read().await.signature_requests();
+        assert_eq!(reqs.len(), 1, "one pending bid per job, never an unbounded queue");
+        assert_eq!(reqs[0].id, first_id, "superseded in place, same id");
+        assert_ne!(reqs[0].calldata, first_calldata, "carries the latest price/latency");
 
         // A bid, once observed, must NOT re-arm (one-shot semantics).
-        let id = state.read().await.signature_requests()[0].id;
-        state.write().await.mark_request_observed(id, "0xbeef".into());
-        placer.place(7, 1_150_000, 600_000).await.expect("still submitted");
-        assert_eq!(
-            state.read().await.signature_requests()[0].status,
-            "submitted"
-        );
+        state.write().await.mark_request_observed(first_id, "0xbeef".into());
+        placer.place(7, 2_000_000, 700_000).await.expect("still submitted");
+        let reqs = state.read().await.signature_requests();
+        assert_eq!(reqs.len(), 1, "no re-arm of a broadcast bid");
+        assert_eq!(reqs[0].status, "submitted");
     }
 }

@@ -20,6 +20,9 @@ executor = { path = "../executor" }
 earnings = { path = "../earnings" }
 supervision = { path = "../supervision" }
 tokio.workspace = true
+# NA-B-008/NA-01: per-job commitment nonces, minted from the vetted OS CSPRNG
+# (already in the tree via supervision) and persisted so a restart reuses them.
+getrandom = "0.2"
 
 [dev-dependencies]
 # Virtual-time test clock for the daemon loop cadence tests.

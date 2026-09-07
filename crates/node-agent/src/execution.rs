@@ -348,8 +348,14 @@ pub struct JobExecutor<V, In, W, I, S> {
     pub chain_id: u64,
     /// Where to cache provisioned weights.
     pub cache_dir: PathBuf,
-    /// The per-job commitment nonce (unpredictable; generated once at startup).
+    /// Fallback per-job commitment nonce, used only when `nonce_store` is `None`
+    /// (unit tests / bid-only). Production sets `nonce_store` so the nonce is
+    /// minted per job and persisted (NA-B-008 / NA-01).
     pub nonce: [u8; 32],
+    /// NA-B-008 / NA-01: mints a fresh nonce per `job_id` and persists it, so the
+    /// nonce is never reused across jobs and survives a restart. When `None`, the
+    /// executor falls back to the static `nonce` field above.
+    pub nonce_store: Option<crate::nonce::NonceStore>,
     pub view: V,
     pub input: In,
     pub weights: W,
@@ -387,6 +393,48 @@ where
         // re-emit is safe and `submitResult` waits for the commitment to land.
         progress.committed = resolved.committed;
 
+        // NA-B-008 / NA-01: resolve this job's commitment nonce. With a store the
+        // nonce is minted once per job id and persisted, so it is never reused
+        // across jobs and survives a restart. If the job is already committed
+        // on-chain but no persisted nonce remains, we must NOT reveal a fresh
+        // nonce — it cannot reproduce the stored commitment and `submitResult`
+        // would be rejected and the stake slashed. Abort instead.
+        let nonce_seed = match &self.nonce_store {
+            Some(store) => match store.load(self.job_id) {
+                Ok(Some(n)) => n,
+                Ok(None) if resolved.committed => {
+                    return record_error(
+                        state,
+                        format!(
+                            "job {}: committed on-chain but no persisted commitment nonce; \
+                             refusing to reveal a fresh nonce that cannot reproduce the \
+                             commitment (NA-01)",
+                            self.job_id
+                        ),
+                    )
+                    .await
+                }
+                Ok(None) => match store.mint(self.job_id) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return record_error(
+                            state,
+                            format!("job {}: minting commitment nonce: {e}", self.job_id),
+                        )
+                        .await
+                    }
+                },
+                Err(e) => {
+                    return record_error(
+                        state,
+                        format!("job {}: loading commitment nonce: {e}", self.job_id),
+                    )
+                    .await
+                }
+            },
+            None => self.nonce,
+        };
+
         // The RunInference step needs the off-chain input; nothing else does. If
         // we're about to run inference and the input hasn't arrived, hold.
         let need_input = resolved.job.state == JobState::Executing && progress.artifacts.is_none();
@@ -423,7 +471,7 @@ where
             &self.weights,
             &self.inference,
             &self.signer,
-            self.nonce,
+            nonce_seed,
             Some(&self.profiler),
         )
         .await
@@ -811,6 +859,7 @@ mod tests {
             chain_id: 40204,
             cache_dir: dir,
             nonce: [0x42; 32],
+            nonce_store: None,
             view: FakeView(rj),
             input,
             weights: Weights,
@@ -865,6 +914,42 @@ mod tests {
             exec.step(&state).await,
             StepOutcome::Signed(WriteIntent::SubmitResult)
         );
+    }
+
+    // NA-01: if the job is committed on-chain but no persisted nonce remains
+    // (e.g. a restart lost the in-memory nonce and the state dir was wiped),
+    // revealing a fresh nonce would fail verification and slash the stake. The
+    // executor must abort (record an error) instead of emitting `submitResult`.
+    #[tokio::test]
+    async fn executor_aborts_reveal_when_committed_but_nonce_is_lost() {
+        let state = shared();
+        let mut exec =
+            executor(resolved_committed(JobState::Executing, ME, true), NoInput, "na01abort");
+        // A store over an empty temp dir → no persisted nonce for this job.
+        let dir = std::env::temp_dir().join(format!(
+            "citrate-nonce-na01-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        exec.nonce_store = Some(crate::nonce::NonceStore::new(dir.clone()));
+        // Restart state: committed=true read from chain, but no artifacts/nonce
+        // held in memory.
+        {
+            let mut p = exec.progress.lock().await;
+            p.artifacts = None;
+            p.nonce = None;
+        }
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("NA-01")),
+            "must abort rather than reveal a mismatched nonce, got {outcome:?}"
+        );
+        // No write was emitted.
+        assert!(exec.signer.recorded().is_empty(), "no submitResult on abort");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
