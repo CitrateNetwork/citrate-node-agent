@@ -146,6 +146,23 @@ pub struct FileInputSource {
 impl InputSource for FileInputSource {
     async fn input_for(&self, job_id: u128) -> Result<Option<Vec<u8>>, String> {
         let path = self.dir.join(format!("{job_id}.bin"));
+        // NA-B-003: bound the delivery BEFORE reading it whole. The requester
+        // controls this file; an unbounded `std::fs::read` of a multi-GB "prompt"
+        // OOMs/disk-thrashes the daemon and blows the execution deadline. Stat
+        // first and refuse an oversized delivery (mirrors the weight-fetch cap).
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("stat {}: {e}", path.display())),
+        };
+        let max = crate::execution::max_job_input_bytes();
+        if meta.len() > max {
+            return Err(format!(
+                "job {job_id} input {} bytes exceeds CITRATE_MAX_JOB_INPUT_BYTES {max}; \
+                 refusing oversized delivery (NA-B-003)",
+                meta.len()
+            ));
+        }
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -209,6 +226,37 @@ impl HeartbeatSender for UnsignedHeartbeatSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NA-B-003 tripwire: the off-chain job input is delivered by the requester
+    // *after* the bid is won; `FileInputSource` read it whole with no size cap
+    // (`std::fs::read`), so a multi-gigabyte prompt could OOM/disk-thrash the
+    // daemon and blow the execution deadline (the on-chain timeout slash). The
+    // cap refuses an oversized delivery instead of reading it.
+    #[tokio::test]
+    async fn file_input_source_rejects_oversized_input() {
+        std::env::set_var("CITRATE_MAX_JOB_INPUT_BYTES", "1024");
+        let dir = std::env::temp_dir().join("citrate-tripwire-na-b-003-input");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deliver a 4 KiB "prompt" for job 7 — over the 1 KiB cap.
+        std::fs::write(dir.join("7.bin"), vec![0u8; 4096]).unwrap();
+
+        let src = FileInputSource { dir: dir.clone() };
+        let res = src.input_for(7).await;
+        assert!(
+            res.is_err(),
+            "NA-B-003 REPRODUCED: oversized job input was accepted (read whole, no cap): {res:?}"
+        );
+        let msg = res.unwrap_err();
+        assert!(msg.contains("exceeds") || msg.contains("cap"), "unclear error: {msg}");
+
+        // A within-cap input for a different job still resolves normally.
+        std::fs::write(dir.join("8.bin"), vec![0u8; 512]).unwrap();
+        assert!(matches!(src.input_for(8).await, Ok(Some(_))));
+
+        std::env::remove_var("CITRATE_MAX_JOB_INPUT_BYTES");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn unsigned_sender_reports_missing_signer_honestly() {
