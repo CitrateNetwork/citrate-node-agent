@@ -36,6 +36,7 @@ mod daemon;
 // directory, and the signing/broadcast *relay* — are the TD-27/TD-17 follow-ups.
 mod execution;
 mod live;
+mod nonce;
 mod profiler;
 mod relay;
 
@@ -469,7 +470,10 @@ fn build_job_executor(
         None => executor::LlamaServerInference::new(llama)?, // FUA-NODE-AGENT-06
     };
 
+    // NA-B-008 / NA-01: mint + persist a per-job commitment nonce. `nonce` below
+    // is only the fallback for the store-less path (never taken in production).
     let nonce = live::random_nonce()?;
+    let nonce_store = nonce::NonceStore::new(nonce::default_state_dir());
 
     Ok(Some(execution::JobExecutor {
         job_id,
@@ -478,6 +482,7 @@ fn build_job_executor(
         chain_id,
         cache_dir: cache_dir.into(),
         nonce,
+        nonce_store: Some(nonce_store),
         view: live::LiveJobView {
             client: chainio::rpc::RpcClient::new(rpc_url.to_string())?,
             marketplace,
