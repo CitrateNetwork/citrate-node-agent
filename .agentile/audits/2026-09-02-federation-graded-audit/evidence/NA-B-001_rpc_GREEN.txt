@@ -1,0 +1,10 @@
+   Compiling chainio v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/chainio)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.81s
+     Running tests/tripwire_na_b_001_rpc_timeout.rs (target/debug/deps/tripwire_na_b_001_rpc_timeout-c7aa50ae118657dd)
+
+running 1 test
+NA-B-001 GREEN: RPC client timed out against a stalled endpoint in 2.001350726s
+test rpc_client_times_out_against_a_stalled_endpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+

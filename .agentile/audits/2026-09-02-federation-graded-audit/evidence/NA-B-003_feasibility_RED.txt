@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/node_agent-97994228f8ed44c9)
+
+running 1 test
+test execution::tests::oversized_input_is_refused_before_running_inference ... FAILED
+
+failures:
+
+---- execution::tests::oversized_input_is_refused_before_running_inference stdout ----
+
+thread 'execution::tests::oversized_input_is_refused_before_running_inference' (2057945) panicked at crates/node-agent/src/execution.rs:652:9:
+assertion `left != right` failed: NA-B-003 REPRODUCED: oversized input ran inference instead of being refused
+  left: RanInference
+ right: RanInference
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    execution::tests::oversized_input_is_refused_before_running_inference
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p node-agent --bin node-agent`

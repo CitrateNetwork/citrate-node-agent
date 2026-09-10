@@ -1,0 +1,19 @@
+   Compiling executor v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/executor)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.73s
+     Running tests/tripwire_na_b_001_gateway_timeout.rs (target/debug/deps/tripwire_na_b_001_gateway_timeout-00c81541b5cad239)
+
+running 1 test
+
+thread 'gateway_fetch_times_out_against_a_stalled_gateway' (1480711) panicked at crates/executor/tests/tripwire_na_b_001_gateway_timeout.rs:49:9:
+NA-B-001 REPRODUCED: gateway fetch never resolved against a stalled gateway (waited 8.001067425s) — the weight client has no timeout
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test gateway_fetch_times_out_against_a_stalled_gateway ... FAILED
+
+failures:
+
+failures:
+    gateway_fetch_times_out_against_a_stalled_gateway
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s
+
+error: test failed, to rerun pass `-p executor --test tripwire_na_b_001_gateway_timeout`

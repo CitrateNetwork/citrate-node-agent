@@ -1,0 +1,11 @@
+   Compiling lifecycle v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/lifecycle)
+   Compiling executor v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/executor)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.83s
+     Running tests/tripwire_na_b_001_inference_timeout.rs (target/debug/deps/tripwire_na_b_001_inference_timeout-73f359b1948a693a)
+
+running 1 test
+NA-B-001/003 GREEN: inference run timed out against a stalled backend in 2.001268759s
+test inference_run_times_out_against_a_stalled_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+

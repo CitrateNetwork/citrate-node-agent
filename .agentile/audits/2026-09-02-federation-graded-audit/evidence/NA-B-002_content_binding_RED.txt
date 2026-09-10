@@ -1,0 +1,105 @@
+   Compiling tokio v1.52.3
+   Compiling hyper v1.10.1
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling chainio v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/chainio)
+   Compiling pinning v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/pinning)
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:43:13
+    |
+ 43 |     let a = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("replica A seals");
+    |             ^^^^^^^^^^^               ------------------------------ unexpected argument #4 of type `&'static [u8; 27]`
+    |
+note: function defined here
+   --> /home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/pinning/src/runloop.rs:114:8
+    |
+114 | pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
+    |        ^^^^^^^^^^^
+help: remove the extra argument
+    |
+ 43 -     let a = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("replica A seals");
+ 43 +     let a = seal_inputs(&cfg, CID, 0).expect("replica A seals");
+    |
+
+error[E0599]: no method named `expect` found for struct `SealInputs` in the current scope
+  --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:43:71
+   |
+43 |     let a = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("replica A seals");
+   |                                                                       ^^^^^^ method not found in `SealInputs`
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:44:13
+    |
+ 44 |     let b = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-BBBB").expect("replica B seals");
+    |             ^^^^^^^^^^^               ------------------------------ unexpected argument #4 of type `&'static [u8; 27]`
+    |
+note: function defined here
+   --> /home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/pinning/src/runloop.rs:114:8
+    |
+114 | pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
+    |        ^^^^^^^^^^^
+help: remove the extra argument
+    |
+ 44 -     let b = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-BBBB").expect("replica B seals");
+ 44 +     let b = seal_inputs(&cfg, CID, 0).expect("replica B seals");
+    |
+
+error[E0599]: no method named `expect` found for struct `SealInputs` in the current scope
+  --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:44:71
+   |
+44 |     let b = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-BBBB").expect("replica B seals");
+   |                                                                       ^^^^^^ method not found in `SealInputs`
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:52:14
+    |
+ 52 |     let a2 = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("re-seal A");
+    |              ^^^^^^^^^^^               ------------------------------ unexpected argument #4 of type `&'static [u8; 27]`
+    |
+note: function defined here
+   --> /home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/pinning/src/runloop.rs:114:8
+    |
+114 | pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
+    |        ^^^^^^^^^^^
+help: remove the extra argument
+    |
+ 52 -     let a2 = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("re-seal A");
+ 52 +     let a2 = seal_inputs(&cfg, CID, 0).expect("re-seal A");
+    |
+
+error[E0599]: no method named `expect` found for struct `SealInputs` in the current scope
+  --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:52:72
+   |
+52 |     let a2 = seal_inputs(&cfg, CID, 0, b"the-real-model-weights-AAAA").expect("re-seal A");
+   |                                                                        ^^^^^^ method not found in `SealInputs`
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:58:9
+    |
+ 58 |         seal_inputs(&cfg, CID, 0, b"").is_err(),
+    |         ^^^^^^^^^^^               --- unexpected argument #4 of type `&'static [u8; 0]`
+    |
+note: function defined here
+   --> /home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/pinning/src/runloop.rs:114:8
+    |
+114 | pub fn seal_inputs(cfg: &PinConfig, cid: [u8; 32], sector: u128) -> SealInputs {
+    |        ^^^^^^^^^^^
+help: remove the extra argument
+    |
+ 58 -         seal_inputs(&cfg, CID, 0, b"").is_err(),
+ 58 +         seal_inputs(&cfg, CID, 0).is_err(),
+    |
+
+error[E0599]: no method named `is_err` found for struct `SealInputs` in the current scope
+  --> crates/pinning/tests/tripwire_na_b_002_content_binding.rs:58:40
+   |
+58 |         seal_inputs(&cfg, CID, 0, b"").is_err(),
+   |                                        ^^^^^^ method not found in `SealInputs`
+
+Some errors have detailed explanations: E0061, E0599.
+For more information about an error, try `rustc --explain E0061`.
+error: could not compile `pinning` (test "tripwire_na_b_002_content_binding") due to 8 previous errors

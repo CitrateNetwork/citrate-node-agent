@@ -1,0 +1,20 @@
+   Compiling lifecycle v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/lifecycle)
+   Compiling executor v0.1.0 (/home/saul/Projects/Citrate-Labs/citrate-node-agent/crates/executor)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.04s
+     Running tests/tripwire_na_b_001_inference_timeout.rs (target/debug/deps/tripwire_na_b_001_inference_timeout-73f359b1948a693a)
+
+running 1 test
+
+thread 'inference_run_times_out_against_a_stalled_backend' (1446226) panicked at crates/executor/tests/tripwire_na_b_001_inference_timeout.rs:63:9:
+NA-B-001/003 REPRODUCED: LlamaServerInference::run never resolved against a stalled backend (waited 8.000825867s) — no request timeout
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test inference_run_times_out_against_a_stalled_backend ... FAILED
+
+failures:
+
+failures:
+    inference_run_times_out_against_a_stalled_backend
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s
+
+error: test failed, to rerun pass `-p executor --test tripwire_na_b_001_inference_timeout`
