@@ -1,5 +1,7 @@
 # citrate-node-agent
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > The GPU execution runtime for a single Citrate seller node — it reads your
 > node settings, registers on the compute marketplace, bids cost-plus, runs real
 > inference, proves and settles the result, and stays un-slashed (heartbeat +
