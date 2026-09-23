@@ -28,12 +28,22 @@ concurrency:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    # Internal-only gate (checks the vendored 40204 address book against the canonical set in the
+    # PRIVATE citrate-chain). Skips on public/fork CI (no token) so public CI never checks out a
+    # private repo; runs authoritatively on internal pushes once CITRATE_CHAIN_READ_TOKEN is set.
+    env:
+      CHAIN_TOKEN: ${{ secrets.CITRATE_CHAIN_READ_TOKEN }}
     steps:
+      - name: Skipped on public/fork CI (no chain read token)
+        if: env.CHAIN_TOKEN == ''
+        run: echo "address-drift is an internal supply-chain gate; skipped without CITRATE_CHAIN_READ_TOKEN."
       - name: Checkout this repo
+        if: env.CHAIN_TOKEN != ''
         uses: actions/checkout@v4
         with:
           path: consumer
       - name: Checkout canonical citrate-chain (sparse)
+        if: env.CHAIN_TOKEN != ''
         uses: actions/checkout@v4
         with:
           repository: CitrateNetwork/citrate-chain
@@ -44,9 +54,11 @@ jobs:
             contracts/addresses
             packages/chain-config
       - uses: actions/setup-node@v4
+        if: env.CHAIN_TOKEN != ''
         with:
           node-version: '20'
       - name: Address drift check (blocking)
+        if: env.CHAIN_TOKEN != ''
         run: |
           node citrate-chain/packages/chain-config/bin/check.mjs \
             check "consumer/crates/chainio/src/generated/addresses.json" \
