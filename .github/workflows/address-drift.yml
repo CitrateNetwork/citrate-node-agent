@@ -11,6 +11,7 @@ name: address-drift
 # `npx @citratelabs/chain-config check <file>` with no cross-repo checkout.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
