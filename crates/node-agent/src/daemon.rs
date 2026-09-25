@@ -185,6 +185,74 @@ pub async fn beat<S: HeartbeatSender>(
     res
 }
 
+/// Where the loop gets the bidder [`Settings`] for a tick (PBA-L6b-008).
+///
+/// The schedule / window-close gates compare against the *current* clock, and
+/// the operator may flip `compute.json` (enabled, schedule) while the daemon
+/// runs, so the loop asks for fresh settings on every tick instead of sampling
+/// them once at startup.
+pub trait SettingsSource {
+    /// The settings to evaluate this tick against.
+    fn current(&self) -> Result<Settings, String>;
+}
+
+/// A fixed [`Settings`] value (tests, one-shot embedders): never changes.
+impl SettingsSource for Settings {
+    fn current(&self) -> Result<Settings, String> {
+        Ok(*self)
+    }
+}
+
+/// Production settings: re-read `compute.json` and re-sample the clock on every
+/// call. `now` returns UNIX seconds (injectable for virtual-time tests).
+pub struct LiveSettings<C: Fn() -> u64> {
+    /// Path to the operator's `compute.json`.
+    pub config_path: std::path::PathBuf,
+    /// Clock: UNIX seconds.
+    pub now: C,
+}
+
+impl<C: Fn() -> u64> SettingsSource for LiveSettings<C> {
+    fn current(&self) -> Result<Settings, String> {
+        let raw = std::fs::read_to_string(&self.config_path)
+            .map_err(|e| format!("reading {}: {e}", self.config_path.display()))?;
+        let cfg = config::ComputeSettings::from_json(&raw)
+            .map_err(|e| format!("parsing {}: {e}", self.config_path.display()))?;
+        let (hour, minute, weekday) = crate::clock::utc_hour_min_weekday((self.now)());
+        Ok(Settings {
+            enabled: cfg.enabled,
+            schedule: cfg.schedule,
+            current_hour: hour,
+            current_min: minute,
+            current_day: weekday,
+        })
+    }
+}
+
+/// Fail-closed settings for a tick whose `compute.json` could not be read or
+/// parsed: participation off, so no bid goes out on stale or unknown policy.
+fn disabled_settings() -> Settings {
+    Settings {
+        enabled: false,
+        schedule: config::Schedule::Always,
+        current_hour: 0,
+        current_min: 0,
+        current_day: config::Weekday::Mon,
+    }
+}
+
+/// Resolve the settings for one tick: the source's answer, or fail-closed
+/// [`disabled_settings`] plus the error to record.
+fn settings_for_tick<P: SettingsSource>(source: &P) -> (Settings, Option<String>) {
+    match source.current() {
+        Ok(s) => (s, None),
+        Err(e) => (
+            disabled_settings(),
+            Some(format!("settings reload failed (not bidding): {e}")),
+        ),
+    }
+}
+
 /// Run the supervised loop until `max_ticks` ticks have run (`None` = forever).
 ///
 /// Each tick runs [`tick`] (bid), then the [`TickExecutor`] (drive a won job —
@@ -193,13 +261,13 @@ pub async fn beat<S: HeartbeatSender>(
 /// interval). The loop never returns on a heartbeat error — it records it and
 /// keeps going.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_loop<V, S, E, B>(
+pub async fn run_loop<V, S, E, B, P>(
     state: SharedState,
     view: &V,
     sender: &S,
     executor: &E,
     bids: &B,
-    settings: &Settings,
+    settings: &P,
     interval: Duration,
     max_ticks: Option<u64>,
 ) where
@@ -207,6 +275,7 @@ pub async fn run_loop<V, S, E, B>(
     S: HeartbeatSender,
     E: TickExecutor,
     B: BidPlacer,
+    P: SettingsSource,
 {
     let mut ticks: u64 = 0;
     loop {
@@ -215,7 +284,12 @@ pub async fn run_loop<V, S, E, B>(
                 return;
             }
         }
-        tick(&state, view, settings, bids).await;
+        // PBA-L6b-008: re-sample the clock and re-read compute.json every tick.
+        let (settings_now, settings_err) = settings_for_tick(settings);
+        tick(&state, view, &settings_now, bids).await;
+        if let Some(e) = &settings_err {
+            state.write().await.set_last_error(Some(e.clone()));
+        }
         executor.tick(&state).await; // drive a won job (no-op in the bid-only loop)
         let _ = beat(&state, sender).await; // errors are recorded, never fatal
         ticks += 1;
@@ -552,5 +626,126 @@ mod tests {
         assert_eq!(*sender.beats.lock().unwrap(), 3);
         // Last tick was a bid.
         assert_eq!(state.read().await.health_at(0).state.as_str(), "bidding");
+    }
+
+    // ── PBA-L6b-008: schedule + compute.json are re-evaluated every tick ──
+
+    /// Counts placed bids.
+    struct CountingBids(Mutex<u64>);
+    impl BidPlacer for CountingBids {
+        async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    /// A TickExecutor that runs `f` after every tick (advances the virtual
+    /// clock / rewrites compute.json between ticks).
+    struct Between<F: Fn() + Sync>(F);
+    impl<F: Fn() + Sync> crate::execution::TickExecutor for Between<F> {
+        async fn tick(&self, _state: &SharedState) {
+            (self.0)();
+        }
+    }
+
+    fn l6b008_config(tag: &str, json: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("citrate-l6b008-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("compute.json");
+        std::fs::write(&p, json).unwrap();
+        p
+    }
+
+    // Virtual time crossing a window boundary: a Nights node started at 23:00
+    // (inside its window) must stop bidding once the clock reaches 11:00.
+    #[tokio::test(start_paused = true)]
+    async fn l6b_008_schedule_is_evaluated_against_the_clock_each_tick() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let path = l6b008_config("clock", r#"{ "enabled": true, "schedule": "nights" }"#);
+        // Epoch day 0 (Thursday) 23:00 UTC.
+        let clock = Arc::new(AtomicU64::new(23 * 3600));
+        let c = clock.clone();
+        let live = LiveSettings {
+            config_path: path.clone(),
+            now: move || c.load(Ordering::SeqCst),
+        };
+        let bids = CountingBids(Mutex::new(0));
+        let adv = clock.clone();
+        let exec = Between(move || {
+            adv.fetch_add(12 * 3600, Ordering::SeqCst); // → Friday 11:00
+        });
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let sender = CountingSender {
+            beats: Mutex::new(0),
+        };
+        run_loop(
+            shared(),
+            &view,
+            &sender,
+            &exec,
+            &bids,
+            &live,
+            heartbeat::HEARTBEAT_INTERVAL,
+            Some(2),
+        )
+        .await;
+        assert_eq!(
+            *bids.0.lock().unwrap(),
+            1,
+            "bid at 23:00 only; 11:00 is outside the Nights window"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // compute.json is re-read every tick: flipping `enabled` off stops bidding
+    // without a restart, and an unreadable file fails closed (no bid, error
+    // recorded).
+    #[tokio::test(start_paused = true)]
+    async fn l6b_008_compute_json_is_reloaded_each_tick_and_fails_closed() {
+        let path = l6b008_config("reload", r#"{ "enabled": true, "schedule": "always" }"#);
+        let live = LiveSettings {
+            config_path: path.clone(),
+            now: || 12 * 3600,
+        };
+        let bids = CountingBids(Mutex::new(0));
+        let step = std::sync::atomic::AtomicU64::new(0);
+        let p2 = path.clone();
+        let exec = Between(move || {
+            match step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => std::fs::write(&p2, r#"{ "enabled": false, "schedule": "always" }"#).unwrap(),
+                1 => std::fs::write(&p2, "not json").unwrap(),
+                _ => {}
+            }
+        });
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let sender = CountingSender {
+            beats: Mutex::new(0),
+        };
+        let state = shared();
+        run_loop(
+            state.clone(),
+            &view,
+            &sender,
+            &exec,
+            &bids,
+            &live,
+            heartbeat::HEARTBEAT_INTERVAL,
+            Some(3),
+        )
+        .await;
+        assert_eq!(*bids.0.lock().unwrap(), 1, "only the first (enabled) tick bids");
+        let err = state.read().await.health_at(0).last_error;
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("settings reload failed")),
+            "a bad compute.json must be surfaced, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
