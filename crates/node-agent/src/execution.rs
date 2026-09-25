@@ -30,7 +30,8 @@ use chainio::abi::Address;
 use chainio::marketplace::{Job, JobState};
 use executor::{provision, CommitmentProver, Inference, ProofMaker, WeightSource};
 use lifecycle::{
-    plan, AbortReason, CommitmentArtifacts, JobSigner, LifecycleAction, PlanInput, WriteIntent,
+    plan, AbortReason, ChainGates, CommitmentArtifacts, JobSigner, LifecycleAction, PlanInput,
+    WaitReason, WriteIntent,
 };
 use supervision::SharedState;
 
@@ -74,6 +75,9 @@ pub struct JobContext {
     pub input: Vec<u8>,
     /// Where to cache provisioned weights.
     pub cache_dir: PathBuf,
+    /// Chain reads gating the reveal / completion writes (effective tier,
+    /// commitment block, verification block, dispute outcome).
+    pub gates: ChainGates,
 }
 
 /// Default hard ceiling on a single off-chain job input (32 MiB). Overridable
@@ -123,6 +127,9 @@ pub enum StepOutcome {
     InfeasibleInput { len: u64, max: u64 },
     /// Job can't proceed (deadline/failed/expired/disputed/not-ours).
     Aborted(AbortReason),
+    /// The next write would be rejected this block (dispute window, reveal in
+    /// the commitment block); nothing was emitted. Re-plan next tick.
+    Waiting(WaitReason),
     /// Provisioning / inference / signing errored this step (recorded, retryable).
     Error(String),
 }
@@ -156,6 +163,7 @@ where
         chain_id: ctx.chain_id,
         committed: progress.committed,
         artifacts: progress.artifacts.as_ref(),
+        gates: ctx.gates,
     });
 
     match action {
@@ -237,6 +245,7 @@ where
             StepOutcome::Done
         }
         LifecycleAction::Idle => StepOutcome::Idle,
+        LifecycleAction::Wait(reason) => StepOutcome::Waiting(reason),
         LifecycleAction::Abort(reason) => {
             // The job is off our plate; release the in-flight slot + surface why.
             let mut w = state.write().await;
@@ -325,6 +334,8 @@ pub struct ResolvedJob {
     /// Whether the commitment has been recorded on-chain (ComputeVerifier
     /// `commitmentSubmitted`) — chain truth that gates `submitResult`.
     pub committed: bool,
+    /// Chain reads gating the reveal / completion writes.
+    pub gates: ChainGates,
 }
 
 /// Reads a job's on-chain state + model location. The live impl does
@@ -546,6 +557,7 @@ where
             expected_sha256: resolved.expected_sha256,
             input,
             cache_dir: self.cache_dir.clone(),
+            gates: resolved.gates,
         };
 
         let outcome = drive_job(
@@ -730,6 +742,14 @@ mod tests {
             expected_sha256: Some(executor::sha256_digest(b"weights")),
             input: b"the prompt".to_vec(),
             cache_dir: dir,
+            gates: commitment_gates(),
+        }
+    }
+
+    fn commitment_gates() -> ChainGates {
+        ChainGates {
+            effective_tier: Some(VerificationTier::Commitment),
+            ..ChainGates::default()
         }
     }
 
@@ -789,8 +809,17 @@ mod tests {
         let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::SubmitResult));
 
-        // 5. Verifying → completeJob.
+        // 5. Verifying, verified at 150, head 200 → inside the dispute window:
+        //    nothing is emitted until block 250.
         c.job.state = JobState::Verifying;
+        c.gates.result_verified_at = 150;
+        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
+        assert_eq!(
+            o,
+            StepOutcome::Waiting(WaitReason::DisputeWindow { ready_at_block: 250 })
+        );
+        // 5b. Window elapsed → completeJob.
+        c.current_block = 250;
         let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
         assert_eq!(o, StepOutcome::Signed(WriteIntent::CompleteJob));
 
@@ -927,6 +956,7 @@ mod tests {
             expected_sha256: Some(executor::sha256_digest(b"weights")),
             current_block: 200,
             committed,
+            gates: commitment_gates(),
         }
     }
 

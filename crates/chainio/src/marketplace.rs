@@ -300,6 +300,19 @@ pub fn encode_register_provider(supported_models: &[Word]) -> Vec<u8> {
     abi::encode_call(selectors::register_provider(), &args)
 }
 
+/// `resultVerifiedAt(uint256 jobId)` calldata.
+pub fn encode_result_verified_at(job_id: u128) -> Vec<u8> {
+    abi::encode_call(selectors::result_verified_at(), &[abi::word_from_u128(job_id)])
+}
+
+/// `disputeResolvedForProvider(uint256 jobId)` calldata.
+pub fn encode_dispute_resolved_for_provider(job_id: u128) -> Vec<u8> {
+    abi::encode_call(
+        selectors::dispute_resolved_for_provider(),
+        &[abi::word_from_u128(job_id)],
+    )
+}
+
 // ---- live RPC convenience (used by the binary + integration tests) ----
 
 /// Live-RPC read helpers. Always compiled (reqwest is a hard dependency), but
@@ -339,6 +352,30 @@ pub mod live {
             .eth_call(oracle, &encode_salt_per_pflop_hour())
             .await?;
         Ok(decode_salt_per_pflop_hour(&data)?)
+    }
+
+    /// Read `resultVerifiedAt(jobId)` (0 = not verified Valid yet).
+    pub async fn result_verified_at(
+        client: &RpcClient,
+        marketplace: Address,
+        job_id: u128,
+    ) -> Result<u128, RpcError> {
+        let data = client
+            .eth_call(marketplace, &encode_result_verified_at(job_id))
+            .await?;
+        Ok(Decoder::new(&data).u128()?)
+    }
+
+    /// Read `disputeResolvedForProvider(jobId)`.
+    pub async fn dispute_resolved_for_provider(
+        client: &RpcClient,
+        marketplace: Address,
+        job_id: u128,
+    ) -> Result<bool, RpcError> {
+        let data = client
+            .eth_call(marketplace, &encode_dispute_resolved_for_provider(job_id))
+            .await?;
+        Ok(Decoder::new(&data).bool()?)
     }
 
     /// Read `ComputePricingOracle.isPriceStale()`.

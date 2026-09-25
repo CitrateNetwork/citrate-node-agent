@@ -132,6 +132,7 @@ impl JobView for LiveJobView {
             expected_sha256: self.weights_sha256, // SECREM-01 SVC-2
             current_block,
             committed,
+            gates: lifecycle::ChainGates::default(),
         })
     }
 }

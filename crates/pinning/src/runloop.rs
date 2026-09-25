@@ -42,6 +42,11 @@ pub trait PinChainView {
     ) -> impl std::future::Future<Output = Result<SlotState, ViewError>> + Send;
     /// The current chain head (block number) — for the deadline guard.
     fn current_block(&self) -> impl std::future::Future<Output = Result<u128, ViewError>> + Send;
+    /// `unallocatedSlotFunding()` — governance backing not yet assigned to a
+    /// slot (what the first `sealCommit` on an unfunded slot draws from).
+    fn unallocated_slot_funding(
+        &self,
+    ) -> impl std::future::Future<Output = Result<u128, ViewError>> + Send;
 }
 
 /// Error reading chain state.
@@ -65,6 +70,9 @@ pub struct PinConfig {
     pub rounds: u128,
     pub per_round: u128,
     pub bond_wei: u128,
+    /// `REWARD` immutable (per pin, fully vested). A fresh slot's budget is
+    /// `quorum * reward_wei`, drawn from `unallocatedSlotFunding`.
+    pub reward_wei: u128,
     /// `CHALLENGE_N` — at the reduced size this == N (4), so an on-chain nonce
     /// indexes a real circuit node. The challenge index passed to the prover is
     /// `nonce % challenge_n`.
@@ -211,6 +219,10 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner, R: ReplicaSource
     let pin = view.pin(cfg.me, cid, sector).await.map_err(TickError::View)?;
     let slot = view.slot(cid, sector).await.map_err(TickError::View)?;
     let current_block = view.current_block().await.map_err(TickError::View)?;
+    let unallocated_slot_funding = view
+        .unallocated_slot_funding()
+        .await
+        .map_err(TickError::View)?;
 
     let input = PinPlanInput {
         me: cfg.me,
@@ -226,6 +238,8 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner, R: ReplicaSource
         incentives: cfg.incentives,
         bond_wei: cfg.bond_wei,
         chain_id: cfg.chain_id,
+        slot_seed_wei: cfg.quorum.saturating_mul(cfg.reward_wei),
+        unallocated_slot_funding,
     };
 
     match plan_pin(&input) {
@@ -280,6 +294,31 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner, R: ReplicaSource
     }
 }
 
+/// Retry pacing for a pin target across ticks. The daemon waits
+/// [`SlotFundingBackoff::after`] before the next tick of the same target.
+#[derive(Debug, Clone)]
+pub struct SlotFundingBackoff {
+    base: std::time::Duration,
+    max: std::time::Duration,
+    current: std::time::Duration,
+}
+
+impl SlotFundingBackoff {
+    pub fn new(base: std::time::Duration, max: std::time::Duration) -> Self {
+        Self {
+            base,
+            max,
+            current: base,
+        }
+    }
+
+    /// Delay before re-ticking the target that produced `outcome`.
+    pub fn after(&mut self, _outcome: &Result<TickOutcome, TickError>) -> std::time::Duration {
+        self.current = self.base;
+        self.current
+    }
+}
+
 /// Map an on-chain 32-byte committed nonce to a reduced-circuit challenge index.
 fn nonce_to_index(nonce: &[u8; 32], challenge_n: u64) -> u64 {
     // The contract stores `nonce = uint(keccak(seed)) % CHALLENGE_N`, so it
@@ -313,6 +352,7 @@ mod tests {
             rounds: 4,
             per_round: 1_000,
             bond_wei: 10_000,
+            reward_wei: 4_000,
             challenge_n: 4,
         }
     }
@@ -335,6 +375,7 @@ mod tests {
         pin: PinState,
         slot: SlotState,
         block: u128,
+        backing: u128,
     }
     impl PinChainView for FakeView {
         async fn registered(&self, _me: Address) -> Result<bool, ViewError> {
@@ -349,6 +390,84 @@ mod tests {
         async fn current_block(&self) -> Result<u128, ViewError> {
             Ok(self.block)
         }
+        async fn unallocated_slot_funding(&self) -> Result<u128, ViewError> {
+            Ok(self.backing)
+        }
+    }
+
+    /// A signer whose relay reports every write reverted with `reason`.
+    struct RevertingSigner(&'static str);
+    impl PinSigner for RevertingSigner {
+        async fn request(
+            &self,
+            _req: PinSignatureRequest,
+        ) -> Result<PinTxObserved, PinSignerError> {
+            Err(PinSignerError::Reverted(self.0.to_string()))
+        }
+    }
+
+    fn fresh_slot_view(backing: u128) -> FakeView {
+        FakeView {
+            registered: true,
+            pin: none_pin(),
+            slot: slot(false, 0, 0),
+            block: 100,
+            backing,
+        }
+    }
+
+    #[tokio::test]
+    async fn seal_revert_for_unbacked_slot_is_a_hold_not_an_error() {
+        // Backing reads sufficient (e.g. raced by another pinner) but the
+        // seal still reverts on the funding check: report a hold, not a fault.
+        let out = tick_pin(
+            &fresh_slot_view(12_000),
+            &FakeSealer,
+            &RevertingSigner("execution reverted: Insufficient slot funding"),
+            &HasReplica,
+            &cfg(),
+            CID,
+            0,
+        )
+        .await;
+        assert_eq!(out, Ok(TickOutcome::Hold(HoldReason::SlotUnfunded)));
+    }
+
+    #[tokio::test]
+    async fn other_seal_reverts_still_surface_as_errors() {
+        let out = tick_pin(
+            &fresh_slot_view(12_000),
+            &FakeSealer,
+            &RevertingSigner("execution reverted: Slot quorum reached"),
+            &HasReplica,
+            &cfg(),
+            CID,
+            0,
+        )
+        .await;
+        assert!(matches!(out, Err(TickError::Sign(PinSignerError::Reverted(_)))));
+    }
+
+    #[tokio::test]
+    async fn fresh_slot_with_backing_seals_through_the_tick() {
+        let signer = RecordingSigner::default();
+        let out = tick_pin(&fresh_slot_view(12_000), &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
+            .await
+            .expect("tick");
+        assert!(matches!(out, TickOutcome::Sealed(_)));
+    }
+
+    #[test]
+    fn funding_hold_backs_off_exponentially_and_resets() {
+        use std::time::Duration;
+        let mut b = SlotFundingBackoff::new(Duration::from_secs(30), Duration::from_secs(240));
+        let hold: Result<TickOutcome, TickError> = Ok(TickOutcome::Hold(HoldReason::SlotUnfunded));
+        let got: Vec<u64> = (0..6).map(|_| b.after(&hold).as_secs()).collect();
+        assert_eq!(got, vec![30, 60, 120, 240, 240, 240]);
+        // Any other outcome returns to the base cadence.
+        assert_eq!(b.after(&Ok(TickOutcome::Idle)).as_secs(), 30);
+        assert_eq!(b.after(&hold).as_secs(), 30);
+        assert_eq!(b.after(&hold).as_secs(), 60);
     }
 
     /// A replica source that always holds bytes for any (cid, sector).
@@ -417,6 +536,7 @@ mod tests {
             pin: none_pin(),
             slot: slot(true, 9_000, 0),
             block: 100,
+            backing: 0,
         };
         let signer = RecordingSigner::default();
         let out = tick_pin(&view, &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
@@ -435,6 +555,7 @@ mod tests {
             pin: none_pin(),
             slot: slot(true, 9_000, 1),
             block: 100,
+            backing: 0,
         };
         let signer = RecordingSigner::default();
         let out = tick_pin(&view, &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
@@ -456,6 +577,7 @@ mod tests {
             pin: none_pin(),
             slot: slot(true, 9_000, 1),
             block: 100,
+            backing: 0,
         };
         let signer = RecordingSigner::default();
         let out = tick_pin(&view, &FakeSealer, &signer, &NoReplica, &cfg(), CID, 0).await;
@@ -474,6 +596,7 @@ mod tests {
             pin: none_pin(),
             slot: slot(true, 9_000, 3),
             block: 100,
+            backing: 0,
         };
         let out = tick_pin(&view, &FakeSealer, &RecordingSigner::default(), &HasReplica, &cfg(), CID, 0)
             .await

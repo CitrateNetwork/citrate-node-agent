@@ -127,7 +127,10 @@ pub enum HoldReason {
     /// Slot already has `liveCount == quorum` live pins and we hold none —
     /// no room to seal a fresh replica here.
     SlotAtQuorum,
-    /// Slot is unfunded (admin hasn't seeded its budget) — nothing to earn yet.
+    /// The slot has no budget yet and the contract's unallocated backing
+    /// (`unallocatedSlotFunding`, topped up by governance `fund()`) cannot seed
+    /// one, so `sealCommit` would revert "Insufficient slot funding". Back off
+    /// until governance funds the contract.
     SlotUnfunded,
     /// Pin is `Slashed`; re-entry needs an explicit `clearSlashed` decision
     /// (operator policy — not auto, to avoid burning bond in a loop).
@@ -164,7 +167,17 @@ pub struct PinPlanInput {
     pub bond_wei: u128,
     /// Chain id (40204).
     pub chain_id: u64,
+    /// `QUORUM * REWARD` — the budget the first `sealCommit` on an unfunded
+    /// slot draws from the contract's unallocated backing.
+    pub slot_seed_wei: u128,
+    /// `unallocatedSlotFunding()` — backing deposited by governance `fund()`
+    /// and not yet assigned to a slot.
+    pub unallocated_slot_funding: u128,
 }
+
+/// Revert reason `IPFSIncentivesV2.sealCommit` returns when the contract holds
+/// too little governance backing to seed a fresh slot's budget.
+pub const INSUFFICIENT_SLOT_FUNDING_REVERT: &str = "Insufficient slot funding";
 
 /// Pure planner: given the on-chain pin/slot state, decide the next action.
 ///
@@ -362,6 +375,9 @@ pub enum PinSignerError {
     NoSigner,
     /// The surface rejected the request (e.g. user declined).
     Declined(String),
+    /// The write was broadcast (or simulated) and reverted on chain; carries
+    /// the revert reason as reported by the relay.
+    Reverted(String),
 }
 
 impl core::fmt::Display for PinSignerError {
@@ -369,6 +385,7 @@ impl core::fmt::Display for PinSignerError {
         match self {
             PinSignerError::NoSigner => write!(f, "no signing surface attached"),
             PinSignerError::Declined(m) => write!(f, "signing declined: {m}"),
+            PinSignerError::Reverted(m) => write!(f, "transaction reverted: {m}"),
         }
     }
 }
@@ -508,7 +525,17 @@ mod tests {
             incentives: INC,
             bond_wei: 10_000,
             chain_id: 40204,
+            slot_seed_wei: SEED,
+            unallocated_slot_funding: 0,
         }
+    }
+
+    /// QUORUM(3) * REWARD(4_000).
+    const SEED: u128 = 12_000;
+
+    fn backed(mut i: PinPlanInput, unallocated: u128) -> PinPlanInput {
+        i.unallocated_slot_funding = unallocated;
+        i
     }
 
     #[test]
@@ -536,6 +563,39 @@ mod tests {
     fn unfunded_slot_holds() {
         let a = plan_pin(&input(none_pin(), slot(false, 0, 0), true, 100));
         assert_eq!(a, PinAction::Hold(HoldReason::SlotUnfunded));
+    }
+
+    #[test]
+    fn fresh_slot_seals_once_governance_backing_covers_the_seed() {
+        // A slot is only marked funded by the first sealCommit, which draws
+        // QUORUM*REWARD from unallocatedSlotFunding. Enough backing → seal.
+        for have in [SEED, SEED + 1] {
+            let a = plan_pin(&backed(input(none_pin(), slot(false, 0, 0), true, 100), have));
+            assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 }, "backing {have}");
+        }
+    }
+
+    #[test]
+    fn fresh_slot_holds_while_backing_is_short() {
+        for have in [0, SEED - 1] {
+            let a = plan_pin(&backed(input(none_pin(), slot(false, 0, 0), true, 100), have));
+            assert_eq!(a, PinAction::Hold(HoldReason::SlotUnfunded), "backing {have}");
+        }
+    }
+
+    #[test]
+    fn funded_slot_does_not_need_backing() {
+        let a = plan_pin(&backed(input(none_pin(), slot(true, 9_000, 0), true, 100), 0));
+        assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 });
+    }
+
+    #[test]
+    fn revert_reason_constant_matches_contract() {
+        assert_eq!(INSUFFICIENT_SLOT_FUNDING_REVERT, "Insufficient slot funding");
+        assert_eq!(
+            PinSignerError::Reverted("x".into()).to_string(),
+            "transaction reverted: x"
+        );
     }
 
     #[test]

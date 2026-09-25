@@ -48,6 +48,14 @@ selector_fn!(claim_rewards, "claimRewards()");
 
 // --- ComputeVerifier (read commitment status) ---
 selector_fn!(get_record, "getRecord(uint256)");
+selector_fn!(commitment_block, "commitmentBlock(uint256)");
+
+// --- ComputeMarketplace (read settlement gates) ---
+selector_fn!(result_verified_at, "resultVerifiedAt(uint256)");
+selector_fn!(
+    dispute_resolved_for_provider,
+    "disputeResolvedForProvider(uint256)"
+);
 
 // --- ComputeMarketplace (write — calldata builders live in `marketplace`) ---
 selector_fn!(register_provider, "registerProvider(bytes32[])");
@@ -83,6 +91,7 @@ selector_fn!(pin_get_pin, "getPin(address,bytes32,uint256)");
 selector_fn!(pin_get_slot, "getSlot(bytes32,uint256)");
 selector_fn!(pin_owed_of, "owedOf(address,bytes32,uint256)");
 selector_fn!(pin_registered, "registered(address)");
+selector_fn!(pin_unallocated_slot_funding, "unallocatedSlotFunding()");
 
 #[cfg(test)]
 mod tests {
@@ -106,6 +115,9 @@ mod tests {
         assert_eq!(hex4(claim_rewards()), "0x372500ab");
 
         assert_eq!(hex4(get_record()), "0x03e9e609");
+        assert_eq!(hex4(commitment_block()), "0x931a9757");
+        assert_eq!(hex4(result_verified_at()), "0x4971df8f");
+        assert_eq!(hex4(dispute_resolved_for_provider()), "0x60c8103e");
 
         assert_eq!(hex4(register_provider()), "0x0589cd44");
         assert_eq!(hex4(bid_on_job()), "0x18360fc2");
@@ -131,6 +143,7 @@ mod tests {
         assert_eq!(hex4(pin_get_slot()), "0x68752a81");
         assert_eq!(hex4(pin_owed_of()), "0xabb31086");
         assert_eq!(hex4(pin_registered()), "0xb2dd5c07");
+        assert_eq!(hex4(pin_unallocated_slot_funding()), "0xffd6b1ac");
     }
 
     /// Sanity: a known ERC-20 selector to prove our keccak derivation is sound.
