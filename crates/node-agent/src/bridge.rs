@@ -59,6 +59,15 @@ pub fn map_job(
     }
 }
 
+/// PBA-L6b-025: the block a bid on `job` must expire at, or `None` when the
+/// job is not open for bids (state other than Posted/Bidding, or the bid
+/// deadline has been reached at `current_block`).
+pub fn bid_expires_block(job: &ChainJob, current_block: u128) -> Option<u128> {
+    use chainio::marketplace::JobState;
+    let open_state = matches!(job.state, JobState::Posted | JobState::Bidding);
+    (open_state && current_block < job.bid_deadline_block).then_some(job.bid_deadline_block)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +130,30 @@ mod tests {
     fn past_deadline_is_zero_seconds_not_underflow() {
         let j = map_job(&chain_job(), 5000, DEFAULT_SECS_PER_BLOCK, 10u128.pow(18), 600);
         assert_eq!(j.secs_until_deadline, 0);
+    }
+
+    // PBA-L6b-025: only Posted/Bidding jobs before their bid deadline are open.
+    #[test]
+    fn l6b_025_bid_window_requires_open_state_and_live_deadline() {
+        use chainio::marketplace::JobState;
+        let mut j = chain_job(); // Bidding, bid deadline 100
+        assert_eq!(bid_expires_block(&j, 99), Some(100));
+        assert_eq!(bid_expires_block(&j, 100), None, "deadline reached");
+        assert_eq!(bid_expires_block(&j, 5000), None, "deadline passed");
+        j.state = JobState::Posted;
+        assert_eq!(bid_expires_block(&j, 50), Some(100));
+        for closed in [
+            JobState::Assigned,
+            JobState::Executing,
+            JobState::Verifying,
+            JobState::Completed,
+            JobState::Expired,
+            JobState::Timeout,
+            JobState::Failed,
+            JobState::Disputed,
+        ] {
+            j.state = closed;
+            assert_eq!(bid_expires_block(&j, 50), None, "{closed:?} is not open for bids");
+        }
     }
 }

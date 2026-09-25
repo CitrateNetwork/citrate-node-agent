@@ -43,6 +43,11 @@ pub struct MarketSnapshot {
     pub job: BidJob,
     /// The pricing oracle reading.
     pub oracle: ComputePricingOracle,
+    /// PBA-L6b-025: `Some(bid_deadline_block)` while the job is open for bids
+    /// (state Posted/Bidding and the bid deadline not yet reached); `None`
+    /// otherwise. A bid is only placed when `Some`, and the unsigned write
+    /// carries this block as its `expires_block`.
+    pub bid_expires_block: Option<u128>,
 }
 
 /// Source of [`MarketSnapshot`]s. Async so the live implementation can do RPC.
@@ -58,12 +63,14 @@ pub trait MarketView {
 /// enqueues an unsigned `bidOnJob` for the signing relay; tests use a
 /// recording fake; [`NoBids`] is the explicit no-op for bid-less loops.
 pub trait BidPlacer {
-    /// Request the `bidOnJob(job_id, price_wei, estimated_latency_ms)` write.
+    /// Request the `bidOnJob(job_id, price_wei, estimated_latency_ms)` write,
+    /// valid until `expires_block` (the job's bid deadline — PBA-L6b-025).
     fn place(
         &self,
         job_id: u128,
         price_wei: u128,
         estimated_latency_ms: u128,
+        expires_block: u128,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
@@ -74,7 +81,7 @@ pub struct NoBids;
 
 #[cfg(test)]
 impl BidPlacer for NoBids {
-    async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
+    async fn place(&self, _: u128, _: u128, _: u128, _: u128) -> Result<(), String> {
         Ok(())
     }
 }
@@ -134,6 +141,13 @@ pub async fn tick<V: MarketView, B: BidPlacer>(
         return TickOutcome::SkippedPaused;
     }
 
+    // PBA-L6b-025: only a job that is open for bids (Posted/Bidding, before its
+    // bid deadline) may be bid on; the bid expires at that deadline.
+    let Some(expires_block) = snapshot.bid_expires_block else {
+        state.write().await.set_idle();
+        return TickOutcome::NoBid;
+    };
+
     // Run the pure bidder and record the resulting tick state.
     let decision = bidder::evaluate(&snapshot.job, &snapshot.oracle, settings, &snapshot.caps);
     match decision {
@@ -145,7 +159,9 @@ pub async fn tick<V: MarketView, B: BidPlacer>(
             // estimated-latency arg mirrors the one-shot path: exec estimate
             // in milliseconds.
             let latency_ms = u128::from(snapshot.job.estimated_exec_secs) * 1000;
-            let placed = bids.place(u128::from(job_id), price_wei, latency_ms).await;
+            let placed = bids
+                .place(u128::from(job_id), price_wei, latency_ms, expires_block)
+                .await;
             let mut w = state.write().await;
             if let Err(e) = placed {
                 w.set_last_error(Some(format!("bid placement failed: {e}")));
@@ -346,6 +362,7 @@ mod tests {
                 salt_per_pflop_hour_wei: bidder::ONE_SALT_WEI,
                 stale: false,
             },
+            bid_expires_block: Some(100),
         }
     }
 
@@ -461,6 +478,7 @@ mod tests {
     /// A recording bid placer (Send + Sync) for the bid-path tests.
     struct RecordingPlacer {
         placed: Mutex<Vec<(u128, u128, u128)>>,
+        expires: Mutex<Vec<u128>>,
     }
     impl BidPlacer for RecordingPlacer {
         async fn place(
@@ -468,11 +486,16 @@ mod tests {
             job_id: u128,
             price_wei: u128,
             latency_ms: u128,
+            expires_block: u128,
         ) -> Result<(), String> {
             self.placed
                 .lock()
                 .expect("mutex not poisoned")
                 .push((job_id, price_wei, latency_ms));
+            self.expires
+                .lock()
+                .expect("mutex not poisoned")
+                .push(expires_block);
             Ok(())
         }
     }
@@ -487,6 +510,7 @@ mod tests {
         };
         let placer = RecordingPlacer {
             placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
         };
         let out = tick(&state, &view, &on_settings(), &placer).await;
         assert_eq!(out, TickOutcome::Bid);
@@ -500,6 +524,43 @@ mod tests {
         assert_eq!(latency_ms, 600 * 1000);
     }
 
+    // PBA-L6b-025: a job that is no longer open for bids (assigned, expired,
+    // or past its bid deadline) must never be bid on, whatever the bidder's
+    // economics say.
+    #[tokio::test]
+    async fn l6b_025_closed_job_is_never_bid_on() {
+        let state = shared();
+        let mut snap = biddable_snapshot();
+        snap.bid_expires_block = None;
+        let view = FakeView {
+            snapshot: snap,
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
+        };
+        let out = tick(&state, &view, &on_settings(), &placer).await;
+        assert_eq!(out, TickOutcome::NoBid);
+        assert!(placer.placed.lock().expect("mutex").is_empty(), "no bid on a closed job");
+    }
+
+    // PBA-L6b-025: the queued bid expires at the job's bid deadline, not 0.
+    #[tokio::test]
+    async fn l6b_025_bid_carries_the_bid_deadline_as_expiry() {
+        let state = shared();
+        let view = FakeView {
+            snapshot: biddable_snapshot(), // bid_expires_block = Some(100)
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
+        };
+        assert_eq!(tick(&state, &view, &on_settings(), &placer).await, TickOutcome::Bid);
+        assert_eq!(*placer.expires.lock().expect("mutex"), vec![100]);
+    }
+
     /// A Skip decision must never reach the placer.
     #[tokio::test]
     async fn skip_decision_places_no_bid() {
@@ -510,6 +571,7 @@ mod tests {
         };
         let placer = RecordingPlacer {
             placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
         };
         let mut s = on_settings();
         s.enabled = false;
@@ -633,7 +695,7 @@ mod tests {
     /// Counts placed bids.
     struct CountingBids(Mutex<u64>);
     impl BidPlacer for CountingBids {
-        async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
+        async fn place(&self, _: u128, _: u128, _: u128, _: u128) -> Result<(), String> {
             *self.0.lock().unwrap() += 1;
             Ok(())
         }

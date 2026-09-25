@@ -81,6 +81,8 @@ impl MarketView for LiveMarketView {
             stake_wei: profile.stake_wei,
             job,
             oracle,
+            // PBA-L6b-025: open-for-bids gate + the bid's expiry block.
+            bid_expires_block: bridge::bid_expires_block(&chain_job, current_block),
         })
     }
 }
