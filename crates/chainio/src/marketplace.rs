@@ -121,6 +121,11 @@ pub struct Job {
     pub execution_deadline_block: u128,
     pub created_at_block: u128,
     pub bid_count: u128,
+    /// PBA-L6b-021: the job's `inputHash` when it is exactly 32 bytes (the SDK
+    /// default: `keccak256(input)`). `None` for any other length or a malformed
+    /// tail; the executor then refuses to run the job (fail closed) because it
+    /// cannot bind the off-chain input to what the requester posted.
+    pub input_hash: Option<Word>,
 }
 
 impl Job {
@@ -130,13 +135,13 @@ impl Job {
         // Outer: a single dynamic tuple → leading offset word (typically 0x20).
         // We don't need its value because the tuple head immediately follows in
         // the standard single-return layout; consume it.
-        let _tuple_offset = d.word()?;
+        let tuple_offset = d.word()?;
 
         let id = d.u128()?;
         let requester = d.address()?;
         let model_hash = d.u256_word()?; // bytes32, raw
         // inputHash is `bytes` (dynamic): its head slot is an offset we skip.
-        let _input_hash_offset = d.word()?;
+        let input_hash_offset = d.word()?;
         let max_price_wei = d.u128()?;
         let tier = VerificationTier::from_u8(d.u8_enum()?)?;
         let state = JobState::from_u8(d.u8_enum()?)?;
@@ -160,8 +165,31 @@ impl Job {
             execution_deadline_block,
             created_at_block,
             bid_count,
+            input_hash: decode_input_hash(data, &tuple_offset, &input_hash_offset),
         })
     }
+}
+
+/// Read the 32-byte `inputHash` from the job tuple's tail, with every offset
+/// and length checked (no overflow, no out-of-bounds slice). Returns `None` for
+/// a malformed tail or a length other than 32: the static head decode never
+/// fails because of it, but the executor fails closed on `None`.
+fn decode_input_hash(data: &[u8], tuple_offset: &Word, rel_offset: &Word) -> Option<Word> {
+    let word_usize = |w: &Word| -> Option<usize> {
+        if w[0..24].iter().any(|&b| b != 0) {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&w[24..32]);
+        usize::try_from(u64::from_be_bytes(b)).ok()
+    };
+    let len_at = word_usize(tuple_offset)?.checked_add(word_usize(rel_offset)?)?;
+    let len_end = len_at.checked_add(32)?;
+    let len_word: Word = data.get(len_at..len_end)?.try_into().ok()?;
+    if word_usize(&len_word)? != 32 {
+        return None;
+    }
+    data.get(len_end..len_end.checked_add(32)?)?.try_into().ok()
 }
 
 /// Decode `saltPerPflopHour() -> uint256` (wei).
@@ -394,6 +422,50 @@ mod tests {
         assert_eq!(j.execution_deadline_block, 200);
         assert_eq!(j.created_at_block, 50);
         assert_eq!(j.bid_count, 2);
+    }
+
+    /// A getJob return with a real `inputHash` tail at `tail_off` (relative to
+    /// the tuple) holding `len` + `payload`.
+    fn job_with_input_tail(tail_off: u128, len: u128, payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        push_word(&mut data, word_from_u128(0x20));
+        push_word(&mut data, word_from_u128(7));
+        push_word(&mut data, word_from_address([0; 20]));
+        push_word(&mut data, [0u8; 32]);
+        push_word(&mut data, word_from_u128(tail_off));
+        push_word(&mut data, word_from_u128(1));
+        push_word(&mut data, word_from_u128(0));
+        push_word(&mut data, word_from_u128(1));
+        push_word(&mut data, word_from_address([0; 20]));
+        for _ in 0..5 {
+            push_word(&mut data, word_from_u128(0));
+        }
+        push_word(&mut data, word_from_u128(len));
+        data.extend_from_slice(payload);
+        data
+    }
+
+    // PBA-L6b-021: the 32-byte inputHash is decoded from the tuple tail.
+    #[test]
+    fn decodes_the_32_byte_input_hash_tail() {
+        let h = [0x5a; 32];
+        let j = Job::decode(&job_with_input_tail(0x1a0, 32, &h)).unwrap();
+        assert_eq!(j.input_hash, Some(h));
+    }
+
+    // Any other length, or a hostile offset, yields None (executor fails closed)
+    // without failing the static head decode and without panicking.
+    #[test]
+    fn non_32_byte_or_hostile_input_hash_is_none() {
+        let j = Job::decode(&job_with_input_tail(0x1a0, 4, &[0xde, 0xad, 0xbe, 0xef])).unwrap();
+        assert_eq!(j.input_hash, None);
+        let j = Job::decode(&job_with_input_tail(0x1a0, 64, &[0u8; 64])).unwrap();
+        assert_eq!(j.input_hash, None);
+        let j = Job::decode(&job_with_input_tail(u64::MAX as u128, 32, &[1u8; 32])).unwrap();
+        assert_eq!(j.input_hash, None);
+        // Length claims 32 but the tail is truncated.
+        let j = Job::decode(&job_with_input_tail(0x1a0, 32, &[1u8; 16])).unwrap();
+        assert_eq!(j.input_hash, None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub use models::{
     provision, sha256_digest, Integrity, IpfsGatewaySource, ProvisionError, ProvisionedModel,
     WeightSource,
 };
-pub use proof::{CommitmentProver, ProofMaker};
+pub use proof::{keccak256_bytes, CommitmentProver, ProofMaker};
 pub use runtime::{
     Inference, InferenceError, InferenceOutput, LlamaServerInference, LLAMA_FIXED_SEED,
 };

@@ -41,6 +41,12 @@ fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
     out
 }
 
+/// `keccak256(data)` — PBA-L6b-021: binds a job's off-chain input to the
+/// on-chain `Job.inputHash` (the SDK posts `keccak256(input)`).
+pub fn keccak256_bytes(data: &[u8]) -> [u8; 32] {
+    keccak256(&[data])
+}
+
 /// Abstracts building a verification proof from an inference output, so the
 /// daemon is proof-tier-agnostic. Only the Commitment tier ships in SELL-S2
 /// (the bidder caps bids < 10 SALT so jobs never auto-upgrade off Commitment);

@@ -78,6 +78,7 @@ mod tests {
             execution_deadline_block: 1000,
             created_at_block: 50,
             bid_count: 1,
+            input_hash: None,
         }
     }
 

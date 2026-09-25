@@ -483,7 +483,39 @@ where
         let need_input = resolved.job.state == JobState::Executing && progress.artifacts.is_none();
         let input = if need_input {
             match self.input.input_for(self.job_id).await {
-                Ok(Some(bytes)) => bytes,
+                Ok(Some(bytes)) => {
+                    // PBA-L6b-021: the off-chain delivery must be the input the
+                    // requester posted. `Job.inputHash` is `keccak256(input)`
+                    // (SDK default); anything else cannot be bound, so fail
+                    // closed rather than execute (and stake on) whatever file
+                    // landed in the input directory.
+                    match resolved.job.input_hash {
+                        Some(h) if executor::keccak256_bytes(&bytes) == h => bytes,
+                        Some(_) => {
+                            return record_error(
+                                state,
+                                format!(
+                                    "job {}: delivered input does not match the on-chain \
+                                     inputHash; refusing to execute (PBA-L6b-021)",
+                                    self.job_id
+                                ),
+                            )
+                            .await
+                        }
+                        None => {
+                            return record_error(
+                                state,
+                                format!(
+                                    "job {}: on-chain inputHash is not a 32-byte keccak256 \
+                                     binding; refusing to execute an unbindable input \
+                                     (PBA-L6b-021)",
+                                    self.job_id
+                                ),
+                            )
+                            .await
+                        }
+                    }
+                }
                 Ok(None) => return StepOutcome::AwaitingInput,
                 Err(e) => {
                     return record_error(state, format!("input for job {}: {e}", self.job_id)).await
@@ -661,6 +693,7 @@ mod tests {
             execution_deadline_block: 1_000,
             created_at_block: 50,
             bid_count: 1,
+            input_hash: None,
         }
     }
 
@@ -873,6 +906,8 @@ mod tests {
     fn resolved_committed(state: JobState, assigned: Address, committed: bool) -> ResolvedJob {
         let mut j = job(state);
         j.assigned_provider = assigned;
+        // PBA-L6b-021: the posted inputHash binds the HasInput delivery.
+        j.input_hash = Some(executor::keccak256_bytes(b"the prompt"));
         ResolvedJob {
             job: j,
             // SECREM-01 SVC-7: real-shaped CIDv1 so the validate_cid guard passes.
@@ -1279,5 +1314,43 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── PBA-L6b-021: the off-chain input must match the on-chain inputHash ──
+
+    #[tokio::test]
+    async fn l6b_021_input_not_matching_onchain_input_hash_is_refused() {
+        let state = shared();
+        let mut rj = resolved(JobState::Executing, ME);
+        rj.job.input_hash = Some(executor::keccak256_bytes(b"what the requester posted"));
+        let exec = executor(rj, HasInput, "l6b021-mismatch");
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("inputHash")),
+            "a substituted input must be refused, got {outcome:?}"
+        );
+        assert!(exec.progress.lock().await.artifacts.is_none(), "no inference ran");
+        assert!(exec.signer.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn l6b_021_unbindable_input_hash_fails_closed() {
+        let state = shared();
+        let mut rj = resolved(JobState::Executing, ME);
+        rj.job.input_hash = None; // not a 32-byte keccak binding
+        let exec = executor(rj, HasInput, "l6b021-none");
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("inputHash")),
+            "an input that cannot be bound must be refused, got {outcome:?}"
+        );
+        assert!(exec.progress.lock().await.artifacts.is_none(), "no inference ran");
+    }
+
+    #[tokio::test]
+    async fn l6b_021_matching_input_runs() {
+        let state = shared();
+        let exec = executor(resolved(JobState::Executing, ME), HasInput, "l6b021-ok");
+        assert_eq!(exec.step(&state).await, StepOutcome::RanInference);
     }
 }
