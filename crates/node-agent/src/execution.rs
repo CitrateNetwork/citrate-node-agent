@@ -295,6 +295,15 @@ fn validate_cid(cid: &str) -> Result<(), String> {
             "SECURITY [SVC-7]: rejecting model CID {cid:?}: unrecognized multibase/version prefix"
         ));
     }
+    // PBA-L6b-039 / NA-03: one CID grammar. The executor's fetch-time grammar
+    // (CIDv0 base58btc, or canonical base32lower CIDv1) is the source of truth;
+    // the checks above only keep their specific SVC-7 error messages.
+    if !executor::models::validate_cid(cid) {
+        return Err(format!(
+            "SECURITY [SVC-7]: rejecting model CID {cid:?}: not a CIDv0 (base58btc) or \
+             canonical base32lower CIDv1 (NA-03)"
+        ));
+    }
     Ok(())
 }
 
@@ -1168,6 +1177,23 @@ mod tests {
                 validate_cid(&injected).is_err(),
                 "expected rejection for {injected:?}"
             );
+        }
+    }
+
+    // PBA-L6b-039 / NA-03: one CID grammar. The pre-provision gate accepted
+    // shapes (base58 `z…`, base16 `f…`, uppercase `B…`/`F…`, `Qm` with 0/O/I/l)
+    // that the executor's fetch-time grammar refuses; the gate must be exactly
+    // as strict, so a job never runs up to provisioning on a CID it can't fetch.
+    #[test]
+    fn l6b_039_single_cid_grammar() {
+        for cid in [
+            format!("z{}", "a".repeat(50)),
+            format!("f{}", "0".repeat(70)),
+            format!("B{}", "A".repeat(58)),
+            format!("Qm{}", "0".repeat(44)), // '0' is not base58btc
+        ] {
+            assert!(validate_cid(&cid).is_err(), "{cid:?} must be refused");
+            assert!(!executor::models::validate_cid(&cid));
         }
     }
 

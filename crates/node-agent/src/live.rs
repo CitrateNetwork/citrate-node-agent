@@ -228,15 +228,13 @@ impl ClaimableView for LiveClaimableView {
     }
 }
 
-/// A 32-byte unpredictable commitment nonce from the OS RNG (`/dev/urandom`).
-/// The Commitment scheme needs the nonce to be unpredictable before the output
-/// is revealed.
+/// A 32-byte unpredictable commitment nonce from the OS CSPRNG.
+/// PBA-L6b-039 / NA-04: `getrandom` (the vetted OS RNG API on every platform)
+/// instead of opening `/dev/urandom`, which does not exist on Windows and can
+/// be absent in a chroot/sandbox.
 pub fn random_nonce() -> Result<[u8; 32], String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
     let mut buf = [0u8; 32];
-    f.read_exact(&mut buf)
-        .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
     Ok(buf)
 }
 
@@ -356,6 +354,15 @@ mod tests {
         let got = src.input_for(5).await;
         assert!(got.is_err(), "a symlinked delivery must be refused, got {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PBA-L6b-039 / NA-04: the fallback nonce comes from the OS CSPRNG.
+    #[test]
+    fn random_nonce_is_fresh_csprng_output() {
+        let a = random_nonce().unwrap();
+        let b = random_nonce().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 32]);
     }
 
     #[tokio::test]
