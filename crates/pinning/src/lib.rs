@@ -140,6 +140,24 @@ pub enum HoldReason {
     ChallengeWindowClosed,
 }
 
+impl core::fmt::Display for HoldReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HoldReason::SlotAtQuorum => write!(f, "slot is at its replication quorum"),
+            HoldReason::SlotUnfunded => write!(
+                f,
+                "slot has no reward budget and the incentives contract holds too little \
+                 governance backing (fund()) to seed one; sealing would revert \
+                 \"{INSUFFICIENT_SLOT_FUNDING_REVERT}\" — backing off until governance funds it"
+            ),
+            HoldReason::PinSlashed => write!(f, "pin is slashed; re-entry needs an operator decision"),
+            HoldReason::ChallengeWindowClosed => {
+                write!(f, "challenge response window closed; nothing to submit")
+            }
+        }
+    }
+}
+
 /// Everything [`plan_pin`] needs to choose the next action for one (cid,sector).
 pub struct PinPlanInput {
     /// This pinner's address.
@@ -590,6 +608,14 @@ mod tests {
     fn funded_slot_does_not_need_backing() {
         let a = plan_pin(&backed(input(none_pin(), slot(true, 9_000, 0), true, 100), 0));
         assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 });
+    }
+
+    #[test]
+    fn slot_unfunded_hold_message_names_the_governance_step() {
+        let m = HoldReason::SlotUnfunded.to_string();
+        assert!(m.contains("fund()"), "{m}");
+        assert!(m.contains(INSUFFICIENT_SLOT_FUNDING_REVERT), "{m}");
+        assert!(m.contains("backing off"), "{m}");
     }
 
     #[test]
