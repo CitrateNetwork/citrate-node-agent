@@ -610,6 +610,88 @@ mod tests {
         assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 });
     }
 
+    fn intent_of(a: PinAction) -> Option<PinIntent> {
+        match a {
+            PinAction::Sign(r) => Some(r.intent),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn challenge_answered_exactly_at_the_deadline_block() {
+        let mut p = none_pin();
+        p.status = PinStatus::Active;
+        p.challenge_open = true;
+        p.challenge_deadline = 200;
+        let a = plan_pin(&input(p, slot(true, 9_000, 1), true, 200));
+        assert!(matches!(a, PinAction::Prove { deadline: 200, .. }), "{a:?}");
+    }
+
+    #[test]
+    fn bond_returned_only_when_done_fully_claimed_and_held() {
+        // rounds 4 × per_round 1_000 → fully vested at 4_000.
+        let done = |claimed: u128, bond: u128| {
+            let mut p = none_pin();
+            p.status = PinStatus::Done;
+            p.round = 4;
+            p.claimed = claimed;
+            p.bond_held = bond;
+            p
+        };
+        assert_eq!(
+            intent_of(plan_pin(&input(done(4_000, 10_000), slot(true, 9_000, 1), true, 100))),
+            Some(PinIntent::ReturnBond)
+        );
+        // Bond already returned → nothing left to do.
+        assert_eq!(
+            plan_pin(&input(done(4_000, 0), slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+        // Still Active and fully vested with bond held → no bond return yet.
+        let mut active = done(4_000, 10_000);
+        active.status = PinStatus::Active;
+        assert_eq!(
+            plan_pin(&input(active, slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+    }
+
+    #[test]
+    fn done_pin_with_unclaimed_vesting_claims_first() {
+        let mut p = none_pin();
+        p.status = PinStatus::Done;
+        p.round = 4;
+        p.claimed = 3_000;
+        p.bond_held = 10_000;
+        assert_eq!(
+            intent_of(plan_pin(&input(p, slot(true, 9_000, 1), true, 100))),
+            Some(PinIntent::Claim)
+        );
+    }
+
+    #[test]
+    fn challenge_opened_only_while_active_and_not_fully_vested() {
+        let mut p = none_pin();
+        p.status = PinStatus::Active;
+        p.round = 3;
+        p.claimed = 3_000;
+        p.bond_held = 10_000;
+        assert_eq!(
+            intent_of(plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100))),
+            Some(PinIntent::Challenge)
+        );
+        // Last round reached → no further challenge.
+        p.round = 4;
+        p.claimed = 4_000;
+        assert_eq!(plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100)), PinAction::Idle);
+        // Done (not Active) with rounds left and nothing owed → no challenge.
+        p.status = PinStatus::Done;
+        p.round = 2;
+        p.claimed = 2_000;
+        p.bond_held = 0;
+        assert_eq!(plan_pin(&input(p, slot(true, 9_000, 1), true, 100)), PinAction::Idle);
+    }
+
     #[test]
     fn slot_unfunded_hold_message_names_the_governance_step() {
         let m = HoldReason::SlotUnfunded.to_string();

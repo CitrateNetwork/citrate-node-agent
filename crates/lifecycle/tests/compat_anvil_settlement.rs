@@ -56,7 +56,13 @@ fn addr(book: &serde_json::Value, name: &str) -> Address {
 /// `eth_sendTransaction` from an unlocked account (gas estimated, so a
 /// reverting call is refused with its reason); `Err` carries the revert.
 /// A mined transaction must also have receipt status 1.
-async fn send(c: &RpcClient, from: &str, to: Address, data: &[u8], value: u128) -> Result<(), String> {
+async fn send(
+    c: &RpcClient,
+    from: &str,
+    to: Address,
+    data: &[u8],
+    value: u128,
+) -> Result<(), String> {
     // Simulate against the pending block first so a revert surfaces with its
     // reason instead of as a mined status-0 receipt.
     c.call_raw(
@@ -103,12 +109,22 @@ async fn mine(c: &RpcClient, n: u128) {
 }
 
 async fn u256(c: &RpcClient, to: Address, sig: &str, args: &[Word]) -> u128 {
-    let data = c.eth_call(to, &abi::encode_call(sel(sig), args)).await.expect(sig);
+    let data = c
+        .eth_call(to, &abi::encode_call(sel(sig), args))
+        .await
+        .expect(sig);
     abi::Decoder::new(&data).u128().expect(sig)
 }
 
 /// `postJob(bytes32,bytes,uint256,uint8,uint256,uint256)`.
-fn encode_post_job(model: Word, input: &[u8], max_price: u128, tier: u8, bid: u128, exec: u128) -> Vec<u8> {
+fn encode_post_job(
+    model: Word,
+    input: &[u8],
+    max_price: u128,
+    tier: u8,
+    bid: u128,
+    exec: u128,
+) -> Vec<u8> {
     let mut d = sel("postJob(bytes32,bytes,uint256,uint8,uint256,uint256)").to_vec();
     d.extend_from_slice(&model);
     d.extend_from_slice(&abi::word_from_u128(6 * 32));
@@ -138,9 +154,13 @@ impl Ctx {
                     .await
                     .expect("record tier"),
             ),
-            commitment_block: chainio::verifier::live::commitment_block(&self.c, self.verifier, job_id)
-                .await
-                .expect("commitmentBlock"),
+            commitment_block: chainio::verifier::live::commitment_block(
+                &self.c,
+                self.verifier,
+                job_id,
+            )
+            .await
+            .expect("commitmentBlock"),
             result_verified_at: mp::live::result_verified_at(&self.c, self.market, job_id)
                 .await
                 .expect("resultVerifiedAt"),
@@ -160,7 +180,9 @@ impl Ctx {
         committed: bool,
         art: Option<&lifecycle::CommitmentArtifacts>,
     ) -> LifecycleAction {
-        let job = mp::live::get_job(&self.c, self.market, job_id).await.expect("getJob");
+        let job = mp::live::get_job(&self.c, self.market, job_id)
+            .await
+            .expect("getJob");
         let head = self.c.eth_block_number().await.expect("head");
         plan(&PlanInput {
             job: &job,
@@ -176,9 +198,15 @@ impl Ctx {
 
     async fn post(&self, model: Word, input: &[u8], price: u128, tier: u8) -> u128 {
         let id = u256(&self.c, self.market, "nextJobId()", &[]).await;
-        send(&self.c, REQUESTER, self.market, &encode_post_job(model, input, price, tier, 5, 200), price)
-            .await
-            .expect("postJob");
+        send(
+            &self.c,
+            REQUESTER,
+            self.market,
+            &encode_post_job(model, input, price, tier, 5, 200),
+            price,
+        )
+        .await
+        .expect("postJob");
         id
     }
 }
@@ -207,19 +235,43 @@ async fn settlement_gates_match_the_deployed_contracts() {
     // Provider registration (idempotent across reruns).
     let model = keccak(&[b"r2-compat-model"]);
     let stake = u256(&cx.c, cx.market, "MIN_PROVIDER_STAKE()", &[]).await;
-    let _ = send(&cx.c, PROVIDER, cx.market, &mp::encode_register_provider(&[model]), stake).await;
+    let _ = send(
+        &cx.c,
+        PROVIDER,
+        cx.market,
+        &mp::encode_register_provider(&[model]),
+        stake,
+    )
+    .await;
 
     // ── Commitment-tier job: 1 SALT, well under the ZK threshold ──
     let input = b"compat input";
     let job_id = cx.post(model, &keccak(&[input]), one, 0).await;
-    send(&cx.c, PROVIDER, cx.market, &mp::encode_bid_on_job(job_id, one / 2, 1_000), 0)
+    send(
+        &cx.c,
+        PROVIDER,
+        cx.market,
+        &mp::encode_bid_on_job(job_id, one / 2, 1_000),
+        0,
+    )
+    .await
+    .expect("bid");
+    send(
+        &cx.c,
+        REQUESTER,
+        cx.market,
+        &mp::encode_assign_best_bid(job_id),
+        0,
+    )
+    .await
+    .expect("assign");
+    let start = signed(
+        cx.plan_now(job_id, false, None).await,
+        WriteIntent::StartExecution,
+    );
+    send(&cx.c, PROVIDER, cx.market, &start, 0)
         .await
-        .expect("bid");
-    send(&cx.c, REQUESTER, cx.market, &mp::encode_assign_best_bid(job_id), 0)
-        .await
-        .expect("assign");
-    let start = signed(cx.plan_now(job_id, false, None).await, WriteIntent::StartExecution);
-    send(&cx.c, PROVIDER, cx.market, &start, 0).await.expect("startExecution");
+        .expect("startExecution");
 
     let output = b"compat output";
     let nonce = keccak(&[b"nonce", &job_id.to_be_bytes()]);
@@ -232,21 +284,38 @@ async fn settlement_gates_match_the_deployed_contracts() {
         output_hash: keccak(&[output]),
         proof,
     };
-    let commit = signed(cx.plan_now(job_id, false, Some(&art)).await, WriteIntent::SubmitCommitment);
-    send(&cx.c, PROVIDER, cx.market, &commit, 0).await.expect("submitCommitment");
+    let commit = signed(
+        cx.plan_now(job_id, false, Some(&art)).await,
+        WriteIntent::SubmitCommitment,
+    );
+    send(&cx.c, PROVIDER, cx.market, &commit, 0)
+        .await
+        .expect("submitCommitment");
 
     // Head == commitment block: the planner holds the reveal one block.
     let g = cx.gates(job_id).await;
     assert_eq!(g.effective_tier, Some(VerificationTier::Commitment));
-    assert_eq!(g.commitment_block, cx.c.eth_block_number().await.expect("head"));
+    assert_eq!(
+        g.commitment_block,
+        cx.c.eth_block_number().await.expect("head")
+    );
     assert_eq!(
         cx.plan_now(job_id, true, Some(&art)).await,
-        LifecycleAction::Wait(WaitReason::RevealAfterCommitBlock { commit_block: g.commitment_block })
+        LifecycleAction::Wait(WaitReason::RevealAfterCommitBlock {
+            commit_block: g.commitment_block
+        })
     );
     mine(&cx.c, 1).await;
-    let reveal = signed(cx.plan_now(job_id, true, Some(&art)).await, WriteIntent::SubmitResult);
-    send(&cx.c, PROVIDER, cx.market, &reveal, 0).await.expect("submitResult");
-    let job = mp::live::get_job(&cx.c, cx.market, job_id).await.expect("getJob");
+    let reveal = signed(
+        cx.plan_now(job_id, true, Some(&art)).await,
+        WriteIntent::SubmitResult,
+    );
+    send(&cx.c, PROVIDER, cx.market, &reveal, 0)
+        .await
+        .expect("submitResult");
+    let job = mp::live::get_job(&cx.c, cx.market, job_id)
+        .await
+        .expect("getJob");
     assert_eq!(job.state, JobState::Verifying);
 
     // Dispute window: the planner waits; the contract rejects completeJob.
@@ -255,11 +324,23 @@ async fn settlement_gates_match_the_deployed_contracts() {
     let ready = verified_at + DISPUTE_WINDOW_BLOCKS;
     assert_eq!(
         cx.plan_now(job_id, true, None).await,
-        LifecycleAction::Wait(WaitReason::DisputeWindow { ready_at_block: ready })
+        LifecycleAction::Wait(WaitReason::DisputeWindow {
+            ready_at_block: ready
+        })
     );
-    let early = send(&cx.c, PROVIDER, cx.market, &mp::encode_complete_job(job_id), 0).await;
+    let early = send(
+        &cx.c,
+        PROVIDER,
+        cx.market,
+        &mp::encode_complete_job(job_id),
+        0,
+    )
+    .await;
     assert!(
-        early.as_ref().err().is_some_and(|e| e.contains("dispute window open")),
+        early
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("dispute window open")),
         "completeJob inside the window must revert: {early:?}"
     );
     // Still waiting one block before the window closes.
@@ -270,9 +351,16 @@ async fn settlement_gates_match_the_deployed_contracts() {
         LifecycleAction::Wait(WaitReason::DisputeWindow { .. })
     ));
     mine(&cx.c, 1).await;
-    let complete = signed(cx.plan_now(job_id, true, None).await, WriteIntent::CompleteJob);
-    send(&cx.c, PROVIDER, cx.market, &complete, 0).await.expect("completeJob after window");
-    let job = mp::live::get_job(&cx.c, cx.market, job_id).await.expect("getJob");
+    let complete = signed(
+        cx.plan_now(job_id, true, None).await,
+        WriteIntent::CompleteJob,
+    );
+    send(&cx.c, PROVIDER, cx.market, &complete, 0)
+        .await
+        .expect("completeJob after window");
+    let job = mp::live::get_job(&cx.c, cx.market, job_id)
+        .await
+        .expect("getJob");
     assert_eq!(job.state, JobState::Completed);
     assert_eq!(cx.plan_now(job_id, true, None).await, LifecycleAction::Done);
 
@@ -287,7 +375,9 @@ async fn settlement_gates_match_the_deployed_contracts() {
         Some(VerificationTier::ZKProof)
     );
     // The planner refuses whatever state the job is in once it is ours.
-    let mut job = mp::live::get_job(&cx.c, cx.market, zk_id).await.expect("getJob");
+    let mut job = mp::live::get_job(&cx.c, cx.market, zk_id)
+        .await
+        .expect("getJob");
     job.state = JobState::Assigned;
     job.assigned_provider = cx.me;
     let head = cx.c.eth_block_number().await.expect("head");
