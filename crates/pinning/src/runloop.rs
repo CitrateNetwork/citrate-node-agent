@@ -260,8 +260,17 @@ pub async fn tick_pin<V: PinChainView, S: Sealer, G: PinSigner, R: ReplicaSource
             let inputs = seal_inputs(cfg, cid, sector, &bytes).map_err(TickError::Seal)?;
             let sealed = sealer.seal(&inputs).await.map_err(TickError::Seal)?;
             let req = seal_commit_request(&input, &sealed, inputs.epoch);
-            let obs = signer.request(req).await.map_err(TickError::Sign)?;
-            Ok(TickOutcome::Sealed(obs))
+            match signer.request(req).await {
+                Ok(obs) => Ok(TickOutcome::Sealed(obs)),
+                // Another pinner consumed the backing between our read and the
+                // seal: this is a funding hold, not a daemon fault.
+                Err(PinSignerError::Reverted(reason))
+                    if reason.contains(crate::INSUFFICIENT_SLOT_FUNDING_REVERT) =>
+                {
+                    Ok(TickOutcome::Hold(crate::HoldReason::SlotUnfunded))
+                }
+                Err(e) => Err(TickError::Sign(e)),
+            }
         }
         PinAction::Prove {
             cid,
@@ -313,7 +322,15 @@ impl SlotFundingBackoff {
     }
 
     /// Delay before re-ticking the target that produced `outcome`.
-    pub fn after(&mut self, _outcome: &Result<TickOutcome, TickError>) -> std::time::Duration {
+    pub fn after(&mut self, outcome: &Result<TickOutcome, TickError>) -> std::time::Duration {
+        if matches!(
+            outcome,
+            Ok(TickOutcome::Hold(crate::HoldReason::SlotUnfunded))
+        ) {
+            let delay = self.current;
+            self.current = self.current.saturating_mul(2).min(self.max);
+            return delay;
+        }
         self.current = self.base;
         self.current
     }

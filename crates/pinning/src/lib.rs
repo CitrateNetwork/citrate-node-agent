@@ -223,7 +223,10 @@ pub fn plan_pin(i: &PinPlanInput) -> PinAction {
                 0,
             );
         }
-        if !i.slot.funded {
+        // A slot's budget is created by the first `sealCommit`, which draws
+        // `QUORUM * REWARD` from governance backing (`fund()`); without that
+        // backing the seal reverts, so hold instead of bonding into a revert.
+        if !i.slot.funded && i.unallocated_slot_funding < i.slot_seed_wei {
             return PinAction::Hold(HoldReason::SlotUnfunded);
         }
         if i.slot.live_count >= i.quorum {
