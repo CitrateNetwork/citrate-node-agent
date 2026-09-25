@@ -23,6 +23,9 @@ tokio.workspace = true
 # NA-B-008/NA-01: per-job commitment nonces, minted from the vetted OS CSPRNG
 # (already in the tree via supervision) and persisted so a restart reuses them.
 getrandom = "0.2"
+# PBA-L6b-022: O_NOFOLLOW / O_NONBLOCK / ELOOP for the capped job-input read.
+# Already in the tree (supervision); declared directly.
+libc = "0.2"
 
 [dev-dependencies]
 # Virtual-time test clock for the daemon loop cadence tests.

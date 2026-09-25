@@ -43,6 +43,11 @@ pub struct MarketSnapshot {
     pub job: BidJob,
     /// The pricing oracle reading.
     pub oracle: ComputePricingOracle,
+    /// PBA-L6b-025: `Some(bid_deadline_block)` while the job is open for bids
+    /// (state Posted/Bidding and the bid deadline not yet reached); `None`
+    /// otherwise. A bid is only placed when `Some`, and the unsigned write
+    /// carries this block as its `expires_block`.
+    pub bid_expires_block: Option<u128>,
 }
 
 /// Source of [`MarketSnapshot`]s. Async so the live implementation can do RPC.
@@ -58,12 +63,14 @@ pub trait MarketView {
 /// enqueues an unsigned `bidOnJob` for the signing relay; tests use a
 /// recording fake; [`NoBids`] is the explicit no-op for bid-less loops.
 pub trait BidPlacer {
-    /// Request the `bidOnJob(job_id, price_wei, estimated_latency_ms)` write.
+    /// Request the `bidOnJob(job_id, price_wei, estimated_latency_ms)` write,
+    /// valid until `expires_block` (the job's bid deadline — PBA-L6b-025).
     fn place(
         &self,
         job_id: u128,
         price_wei: u128,
         estimated_latency_ms: u128,
+        expires_block: u128,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
@@ -74,7 +81,7 @@ pub struct NoBids;
 
 #[cfg(test)]
 impl BidPlacer for NoBids {
-    async fn place(&self, _: u128, _: u128, _: u128) -> Result<(), String> {
+    async fn place(&self, _: u128, _: u128, _: u128, _: u128) -> Result<(), String> {
         Ok(())
     }
 }
@@ -134,6 +141,13 @@ pub async fn tick<V: MarketView, B: BidPlacer>(
         return TickOutcome::SkippedPaused;
     }
 
+    // PBA-L6b-025: only a job that is open for bids (Posted/Bidding, before its
+    // bid deadline) may be bid on; the bid expires at that deadline.
+    let Some(expires_block) = snapshot.bid_expires_block else {
+        state.write().await.set_idle();
+        return TickOutcome::NoBid;
+    };
+
     // Run the pure bidder and record the resulting tick state.
     let decision = bidder::evaluate(&snapshot.job, &snapshot.oracle, settings, &snapshot.caps);
     match decision {
@@ -145,7 +159,9 @@ pub async fn tick<V: MarketView, B: BidPlacer>(
             // estimated-latency arg mirrors the one-shot path: exec estimate
             // in milliseconds.
             let latency_ms = u128::from(snapshot.job.estimated_exec_secs) * 1000;
-            let placed = bids.place(u128::from(job_id), price_wei, latency_ms).await;
+            let placed = bids
+                .place(u128::from(job_id), price_wei, latency_ms, expires_block)
+                .await;
             let mut w = state.write().await;
             if let Err(e) = placed {
                 w.set_last_error(Some(format!("bid placement failed: {e}")));
@@ -185,6 +201,74 @@ pub async fn beat<S: HeartbeatSender>(
     res
 }
 
+/// Where the loop gets the bidder [`Settings`] for a tick (PBA-L6b-008).
+///
+/// The schedule / window-close gates compare against the *current* clock, and
+/// the operator may flip `compute.json` (enabled, schedule) while the daemon
+/// runs, so the loop asks for fresh settings on every tick instead of sampling
+/// them once at startup.
+pub trait SettingsSource {
+    /// The settings to evaluate this tick against.
+    fn current(&self) -> Result<Settings, String>;
+}
+
+/// A fixed [`Settings`] value (tests, one-shot embedders): never changes.
+impl SettingsSource for Settings {
+    fn current(&self) -> Result<Settings, String> {
+        Ok(*self)
+    }
+}
+
+/// Production settings: re-read `compute.json` and re-sample the clock on every
+/// call. `now` returns UNIX seconds (injectable for virtual-time tests).
+pub struct LiveSettings<C: Fn() -> u64> {
+    /// Path to the operator's `compute.json`.
+    pub config_path: std::path::PathBuf,
+    /// Clock: UNIX seconds.
+    pub now: C,
+}
+
+impl<C: Fn() -> u64> SettingsSource for LiveSettings<C> {
+    fn current(&self) -> Result<Settings, String> {
+        let raw = std::fs::read_to_string(&self.config_path)
+            .map_err(|e| format!("reading {}: {e}", self.config_path.display()))?;
+        let cfg = config::ComputeSettings::from_json(&raw)
+            .map_err(|e| format!("parsing {}: {e}", self.config_path.display()))?;
+        let (hour, minute, weekday) = crate::clock::utc_hour_min_weekday((self.now)());
+        Ok(Settings {
+            enabled: cfg.enabled,
+            schedule: cfg.schedule,
+            current_hour: hour,
+            current_min: minute,
+            current_day: weekday,
+        })
+    }
+}
+
+/// Fail-closed settings for a tick whose `compute.json` could not be read or
+/// parsed: participation off, so no bid goes out on stale or unknown policy.
+fn disabled_settings() -> Settings {
+    Settings {
+        enabled: false,
+        schedule: config::Schedule::Always,
+        current_hour: 0,
+        current_min: 0,
+        current_day: config::Weekday::Mon,
+    }
+}
+
+/// Resolve the settings for one tick: the source's answer, or fail-closed
+/// [`disabled_settings`] plus the error to record.
+fn settings_for_tick<P: SettingsSource>(source: &P) -> (Settings, Option<String>) {
+    match source.current() {
+        Ok(s) => (s, None),
+        Err(e) => (
+            disabled_settings(),
+            Some(format!("settings reload failed (not bidding): {e}")),
+        ),
+    }
+}
+
 /// Run the supervised loop until `max_ticks` ticks have run (`None` = forever).
 ///
 /// Each tick runs [`tick`] (bid), then the [`TickExecutor`] (drive a won job —
@@ -193,13 +277,13 @@ pub async fn beat<S: HeartbeatSender>(
 /// interval). The loop never returns on a heartbeat error — it records it and
 /// keeps going.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_loop<V, S, E, B>(
+pub async fn run_loop<V, S, E, B, P>(
     state: SharedState,
     view: &V,
     sender: &S,
     executor: &E,
     bids: &B,
-    settings: &Settings,
+    settings: &P,
     interval: Duration,
     max_ticks: Option<u64>,
 ) where
@@ -207,6 +291,7 @@ pub async fn run_loop<V, S, E, B>(
     S: HeartbeatSender,
     E: TickExecutor,
     B: BidPlacer,
+    P: SettingsSource,
 {
     let mut ticks: u64 = 0;
     loop {
@@ -215,7 +300,12 @@ pub async fn run_loop<V, S, E, B>(
                 return;
             }
         }
-        tick(&state, view, settings, bids).await;
+        // PBA-L6b-008: re-sample the clock and re-read compute.json every tick.
+        let (settings_now, settings_err) = settings_for_tick(settings);
+        tick(&state, view, &settings_now, bids).await;
+        if let Some(e) = &settings_err {
+            state.write().await.set_last_error(Some(e.clone()));
+        }
         executor.tick(&state).await; // drive a won job (no-op in the bid-only loop)
         let _ = beat(&state, sender).await; // errors are recorded, never fatal
         ticks += 1;
@@ -272,6 +362,7 @@ mod tests {
                 salt_per_pflop_hour_wei: bidder::ONE_SALT_WEI,
                 stale: false,
             },
+            bid_expires_block: Some(100),
         }
     }
 
@@ -387,6 +478,7 @@ mod tests {
     /// A recording bid placer (Send + Sync) for the bid-path tests.
     struct RecordingPlacer {
         placed: Mutex<Vec<(u128, u128, u128)>>,
+        expires: Mutex<Vec<u128>>,
     }
     impl BidPlacer for RecordingPlacer {
         async fn place(
@@ -394,11 +486,16 @@ mod tests {
             job_id: u128,
             price_wei: u128,
             latency_ms: u128,
+            expires_block: u128,
         ) -> Result<(), String> {
             self.placed
                 .lock()
                 .expect("mutex not poisoned")
                 .push((job_id, price_wei, latency_ms));
+            self.expires
+                .lock()
+                .expect("mutex not poisoned")
+                .push(expires_block);
             Ok(())
         }
     }
@@ -413,6 +510,7 @@ mod tests {
         };
         let placer = RecordingPlacer {
             placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
         };
         let out = tick(&state, &view, &on_settings(), &placer).await;
         assert_eq!(out, TickOutcome::Bid);
@@ -426,6 +524,90 @@ mod tests {
         assert_eq!(latency_ms, 600 * 1000);
     }
 
+    // PBA-L6b-025: a job that is no longer open for bids (assigned, expired,
+    // or past its bid deadline) must never be bid on, whatever the bidder's
+    // economics say.
+    #[tokio::test]
+    async fn l6b_025_closed_job_is_never_bid_on() {
+        let state = shared();
+        let mut snap = biddable_snapshot();
+        snap.bid_expires_block = None;
+        let view = FakeView {
+            snapshot: snap,
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
+        };
+        let out = tick(&state, &view, &on_settings(), &placer).await;
+        assert_eq!(out, TickOutcome::NoBid);
+        assert!(placer.placed.lock().expect("mutex").is_empty(), "no bid on a closed job");
+    }
+
+    // PBA-L6b-021 (R2 verifier): an open, profitable job whose on-chain
+    // inputHash is not a bindable 32-byte keccak (CID bytes via the SDK's
+    // documented path) reaches the tick through the same bridge gate the live
+    // view uses, and must produce NO bid — so the provider never wins a job its
+    // executor will refuse, and `timeoutJob` never slashes it.
+    #[tokio::test]
+    async fn l6b_021_unbindable_input_hash_places_no_bid() {
+        use chainio::marketplace::{Job as ChainJob, JobState, VerificationTier as ChainTier};
+        let mk = |input_hash| ChainJob {
+            id: 7,
+            requester: [0xaa; 20],
+            model_hash: [0u8; 32],
+            max_price_wei: 4 * bidder::ONE_SALT_WEI,
+            tier: ChainTier::Commitment,
+            state: JobState::Bidding,
+            assigned_provider: [0; 20],
+            escrow_wei: 4 * bidder::ONE_SALT_WEI,
+            bid_deadline_block: 100,
+            execution_deadline_block: 1000,
+            created_at_block: 50,
+            bid_count: 0,
+            input_hash,
+        };
+        for (hash, want) in [
+            (Some([0x11; 32]), TickOutcome::Bid),
+            (None, TickOutcome::NoBid),
+        ] {
+            let state = shared();
+            let mut snap = biddable_snapshot();
+            snap.bid_expires_block = crate::bridge::bid_expires_block(&mk(hash), 50);
+            let view = FakeView {
+                snapshot: snap,
+                fail: false,
+            };
+            let placer = RecordingPlacer {
+                placed: Mutex::new(Vec::new()),
+                expires: Mutex::new(Vec::new()),
+            };
+            assert_eq!(tick(&state, &view, &on_settings(), &placer).await, want);
+            assert_eq!(
+                placer.placed.lock().expect("mutex").is_empty(),
+                want == TickOutcome::NoBid,
+                "PBA-L6b-021: bid iff the inputHash is bindable (hash={hash:?})"
+            );
+        }
+    }
+
+    // PBA-L6b-025: the queued bid expires at the job's bid deadline, not 0.
+    #[tokio::test]
+    async fn l6b_025_bid_carries_the_bid_deadline_as_expiry() {
+        let state = shared();
+        let view = FakeView {
+            snapshot: biddable_snapshot(), // bid_expires_block = Some(100)
+            fail: false,
+        };
+        let placer = RecordingPlacer {
+            placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
+        };
+        assert_eq!(tick(&state, &view, &on_settings(), &placer).await, TickOutcome::Bid);
+        assert_eq!(*placer.expires.lock().expect("mutex"), vec![100]);
+    }
+
     /// A Skip decision must never reach the placer.
     #[tokio::test]
     async fn skip_decision_places_no_bid() {
@@ -436,6 +618,7 @@ mod tests {
         };
         let placer = RecordingPlacer {
             placed: Mutex::new(Vec::new()),
+            expires: Mutex::new(Vec::new()),
         };
         let mut s = on_settings();
         s.enabled = false;
@@ -552,5 +735,126 @@ mod tests {
         assert_eq!(*sender.beats.lock().unwrap(), 3);
         // Last tick was a bid.
         assert_eq!(state.read().await.health_at(0).state.as_str(), "bidding");
+    }
+
+    // ── PBA-L6b-008: schedule + compute.json are re-evaluated every tick ──
+
+    /// Counts placed bids.
+    struct CountingBids(Mutex<u64>);
+    impl BidPlacer for CountingBids {
+        async fn place(&self, _: u128, _: u128, _: u128, _: u128) -> Result<(), String> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    /// A TickExecutor that runs `f` after every tick (advances the virtual
+    /// clock / rewrites compute.json between ticks).
+    struct Between<F: Fn() + Sync>(F);
+    impl<F: Fn() + Sync> crate::execution::TickExecutor for Between<F> {
+        async fn tick(&self, _state: &SharedState) {
+            (self.0)();
+        }
+    }
+
+    fn l6b008_config(tag: &str, json: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("citrate-l6b008-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("compute.json");
+        std::fs::write(&p, json).unwrap();
+        p
+    }
+
+    // Virtual time crossing a window boundary: a Nights node started at 23:00
+    // (inside its window) must stop bidding once the clock reaches 11:00.
+    #[tokio::test(start_paused = true)]
+    async fn l6b_008_schedule_is_evaluated_against_the_clock_each_tick() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let path = l6b008_config("clock", r#"{ "enabled": true, "schedule": "nights" }"#);
+        // Epoch day 0 (Thursday) 23:00 UTC.
+        let clock = Arc::new(AtomicU64::new(23 * 3600));
+        let c = clock.clone();
+        let live = LiveSettings {
+            config_path: path.clone(),
+            now: move || c.load(Ordering::SeqCst),
+        };
+        let bids = CountingBids(Mutex::new(0));
+        let adv = clock.clone();
+        let exec = Between(move || {
+            adv.fetch_add(12 * 3600, Ordering::SeqCst); // → Friday 11:00
+        });
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let sender = CountingSender {
+            beats: Mutex::new(0),
+        };
+        run_loop(
+            shared(),
+            &view,
+            &sender,
+            &exec,
+            &bids,
+            &live,
+            heartbeat::HEARTBEAT_INTERVAL,
+            Some(2),
+        )
+        .await;
+        assert_eq!(
+            *bids.0.lock().unwrap(),
+            1,
+            "bid at 23:00 only; 11:00 is outside the Nights window"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // compute.json is re-read every tick: flipping `enabled` off stops bidding
+    // without a restart, and an unreadable file fails closed (no bid, error
+    // recorded).
+    #[tokio::test(start_paused = true)]
+    async fn l6b_008_compute_json_is_reloaded_each_tick_and_fails_closed() {
+        let path = l6b008_config("reload", r#"{ "enabled": true, "schedule": "always" }"#);
+        let live = LiveSettings {
+            config_path: path.clone(),
+            now: || 12 * 3600,
+        };
+        let bids = CountingBids(Mutex::new(0));
+        let step = std::sync::atomic::AtomicU64::new(0);
+        let p2 = path.clone();
+        let exec = Between(move || {
+            match step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => std::fs::write(&p2, r#"{ "enabled": false, "schedule": "always" }"#).unwrap(),
+                1 => std::fs::write(&p2, "not json").unwrap(),
+                _ => {}
+            }
+        });
+        let view = FakeView {
+            snapshot: biddable_snapshot(),
+            fail: false,
+        };
+        let sender = CountingSender {
+            beats: Mutex::new(0),
+        };
+        let state = shared();
+        run_loop(
+            state.clone(),
+            &view,
+            &sender,
+            &exec,
+            &bids,
+            &live,
+            heartbeat::HEARTBEAT_INTERVAL,
+            Some(3),
+        )
+        .await;
+        assert_eq!(*bids.0.lock().unwrap(), 1, "only the first (enabled) tick bids");
+        let err = state.read().await.health_at(0).last_error;
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("settings reload failed")),
+            "a bad compute.json must be surfaced, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

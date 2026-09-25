@@ -22,6 +22,24 @@ pub struct SidecarSealer {
     /// `CITRATE_SEALER_BIN`). The daemon refuses to construct one if the binary
     /// is absent — per the no-stub rule, no fake fallback.
     bin: std::path::PathBuf,
+    /// PBA-L6b-039: wall-clock budget for one sidecar call. A wedged prover
+    /// must error (and be killed), never park the pinning tick past the
+    /// challenge window. `CITRATE_SEALER_TIMEOUT_SECS`, default
+    /// [`DEFAULT_SEALER_TIMEOUT_SECS`].
+    timeout: std::time::Duration,
+}
+
+/// Default per-call sidecar budget (seconds). Sealing/proving is CPU-heavy, so
+/// the default is generous; it only has to be finite.
+pub const DEFAULT_SEALER_TIMEOUT_SECS: u64 = 900;
+
+fn sealer_timeout_from_env() -> std::time::Duration {
+    let secs = std::env::var("CITRATE_SEALER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_SEALER_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 impl SidecarSealer {
@@ -35,7 +53,16 @@ impl SidecarSealer {
                 bin.display()
             )));
         }
-        Ok(Self { bin })
+        Ok(Self {
+            bin,
+            timeout: sealer_timeout_from_env(),
+        })
+    }
+
+    /// Override the per-call budget.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Construct from `CITRATE_SEALER_BIN` (the deployment's configured path).
@@ -54,6 +81,8 @@ impl SidecarSealer {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // PBA-L6b-039: a timed-out call drops the child → it is killed.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| SealerError::Prove(format!("spawn citrate-sealer: {e}")))?;
 
@@ -69,9 +98,14 @@ impl SidecarSealer {
             // Drop stdin → EOF → the sidecar's read loop responds and exits.
         }
 
-        let out = child
-            .wait_with_output()
+        let out = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
+            .map_err(|_| {
+                SealerError::Prove(format!(
+                    "citrate-sealer did not answer within {:?}; killed (PBA-L6b-039)",
+                    self.timeout
+                ))
+            })?
             .map_err(|e| SealerError::Prove(format!("sidecar wait: {e}")))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -173,6 +207,36 @@ impl Sealer for SidecarSealer {
 mod tests {
     use super::*;
 
+    // PBA-L6b-039: a sidecar that never answers must time out (and be
+    // killed), not park the pinning tick forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l6b_039_wedged_sidecar_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("l6b039-sealer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("citrate-sealer");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sealer = SidecarSealer::new(&bin)
+            .unwrap()
+            .with_timeout(std::time::Duration::from_secs(1));
+        let inputs = SealInputs {
+            pinner_identity: [0xBE; 32],
+            cid: [0x11; 32],
+            sector: 7,
+            epoch: 42,
+            data: [[0u8; 32]; 4],
+        };
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), sealer.seal(&inputs))
+            .await
+            .expect("PBA-L6b-039: sidecar call never returned (no timeout)");
+        assert!(r.is_err(), "a wedged sidecar must error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn missing_binary_fails_closed() {
         let r = SidecarSealer::new("/nonexistent/citrate-sealer");
@@ -242,5 +306,55 @@ mod tests {
         assert_ne!(sealed.replica_id, [0u8; 32]);
         let post = sealer.prove_post(&inputs, 1).await.expect("prove_post");
         assert!(!post.is_empty());
+    }
+
+    // ── PBA-L6b-039 mutation-hardening: the sidecar protocol + budget ──
+
+    #[cfg(unix)]
+    fn fake_sealer(tag: &str, script: &str) -> (SidecarSealer, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("l6b039-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("citrate-sealer");
+        std::fs::write(&bin, format!("#!/bin/sh\ncat >/dev/null\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (
+            SidecarSealer::new(&bin).unwrap().with_timeout(std::time::Duration::from_secs(20)),
+            dir,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_accepts_ok_true_and_rejects_ok_false_and_bad_exit() {
+        let (s, d) = fake_sealer("ok", r#"echo '{"ok":true,"proof":"0x01"}'"#);
+        let v = s.call("{}".into()).await.expect("ok:true is success");
+        assert_eq!(v["proof"], "0x01");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let (s, d) = fake_sealer("okfalse", r#"echo '{"ok":false,"error":"boom"}'"#);
+        let e = s.call("{}".into()).await.unwrap_err();
+        assert!(format!("{e:?}").contains("boom"));
+        let _ = std::fs::remove_dir_all(&d);
+
+        let (s, d) = fake_sealer("exit1", r#"echo '{"ok":true}'; exit 1"#);
+        assert!(s.call("{}".into()).await.is_err(), "non-zero exit is an error");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sealer_timeout_env_override_and_zero_fallback() {
+        std::env::set_var("CITRATE_SEALER_TIMEOUT_SECS", "5");
+        assert_eq!(sealer_timeout_from_env(), std::time::Duration::from_secs(5));
+        std::env::set_var("CITRATE_SEALER_TIMEOUT_SECS", "0");
+        assert_eq!(
+            sealer_timeout_from_env(),
+            std::time::Duration::from_secs(DEFAULT_SEALER_TIMEOUT_SECS)
+        );
+        std::env::remove_var("CITRATE_SEALER_TIMEOUT_SECS");
+        assert_eq!(
+            sealer_timeout_from_env(),
+            std::time::Duration::from_secs(DEFAULT_SEALER_TIMEOUT_SECS)
+        );
     }
 }

@@ -41,6 +41,12 @@ fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
     out
 }
 
+/// `keccak256(data)` — PBA-L6b-021: binds a job's off-chain input to the
+/// on-chain `Job.inputHash` (the SDK posts `keccak256(input)`).
+pub fn keccak256_bytes(data: &[u8]) -> [u8; 32] {
+    keccak256(&[data])
+}
+
 /// Abstracts building a verification proof from an inference output, so the
 /// daemon is proof-tier-agnostic. Only the Commitment tier ships in SELL-S2
 /// (the bidder caps bids < 10 SALT so jobs never auto-upgrade off Commitment);
@@ -179,5 +185,22 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xff;
         assert!(!on_chain_verify(&art.commitment, &tampered));
+    }
+
+    // PBA-L6b-021: keccak256_bytes is real Keccak-256 (known vectors), so the
+    // inputHash binding compares against what the SDK actually posts.
+    #[test]
+    fn keccak256_bytes_known_vectors() {
+        fn hex(b: &[u8; 32]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        assert_eq!(
+            hex(&keccak256_bytes(b"")),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+        assert_eq!(
+            hex(&keccak256_bytes(b"abc")),
+            "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+        );
     }
 }

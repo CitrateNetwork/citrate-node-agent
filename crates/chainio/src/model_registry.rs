@@ -32,16 +32,16 @@ pub fn encode_get_model(model_hash: [u8; 32]) -> Vec<u8> {
 }
 
 /// Read the `i`th 32-byte word of `data`.
+///
+/// PBA-L6b-023: `i` can come from a hostile offset word, so the byte range is
+/// computed with checked arithmetic and an overflow is a decode error.
 fn word_at(data: &[u8], i: usize) -> Result<&[u8], AbiError> {
-    let start = i * 32;
-    let end = start + 32;
-    if end > data.len() {
-        return Err(AbiError::TooShort {
-            need: end.div_ceil(32),
-            got: data.len() / 32,
-        });
-    }
-    Ok(&data[start..end])
+    let start = i.checked_mul(32).ok_or(AbiError::Overflow)?;
+    let end = start.checked_add(32).ok_or(AbiError::Overflow)?;
+    data.get(start..end).ok_or(AbiError::TooShort {
+        need: i.saturating_add(1),
+        got: data.len() / 32,
+    })
 }
 
 /// Interpret a 32-byte big-endian word as a `usize` byte-offset/length (the top
@@ -52,7 +52,7 @@ fn be_usize(w: &[u8]) -> Result<usize, AbiError> {
     }
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&w[24..32]);
-    Ok(u64::from_be_bytes(buf) as usize)
+    usize::try_from(u64::from_be_bytes(buf)).map_err(|_| AbiError::Overflow)
 }
 
 /// Decode the ABI return of `getModel(bytes32)`:
@@ -88,15 +88,15 @@ pub fn decode_get_model(data: &[u8]) -> Result<ModelInfo, AbiError> {
         return Err(AbiError::BadHex);
     }
     let len = be_usize(len_word)?;
-    let start = cid_off + 32;
-    let end = start + len;
-    if end > data.len() {
-        return Err(AbiError::TooShort {
-            need: end.div_ceil(32),
-            got: data.len() / 32,
-        });
-    }
-    let ipfs_cid = String::from_utf8(data[start..end].to_vec()).map_err(|_| AbiError::BadString)?;
+    // PBA-L6b-023: offset and length are attacker-shaped (RPC / registry), so
+    // every step is checked; an overflow or out-of-range slice is an error.
+    let start = cid_off.checked_add(32).ok_or(AbiError::Overflow)?;
+    let end = start.checked_add(len).ok_or(AbiError::Overflow)?;
+    let bytes = data.get(start..end).ok_or(AbiError::TooShort {
+        need: end.div_ceil(32),
+        got: data.len() / 32,
+    })?;
+    let ipfs_cid = String::from_utf8(bytes.to_vec()).map_err(|_| AbiError::BadString)?;
 
     Ok(ModelInfo {
         owner,
@@ -188,5 +188,61 @@ mod tests {
     #[test]
     fn truncated_data_errors() {
         assert!(decode_get_model(&[0u8; 64]).is_err());
+    }
+
+    // PBA-L6b-023 (L6b PoC `l6b_decode_get_model_panics_on_hostile_len`): a
+    // hostile RPC / registry return must decode to an Err, never panic the
+    // daemon (start + len overflowed in debug and release).
+    fn hostile_len() -> Vec<u8> {
+        let mut d = vec![0u8; 32 * 10];
+        d[4 * 32 + 30] = 0x01; // word 4: ipfsCID offset = 0x100 (word 8)
+        d[7 * 32 + 31] = 1; // word 7: isActive = true
+        for b in &mut d[8 * 32 + 24..8 * 32 + 32] {
+            *b = 0xff; // word 8: length = 0xFFFF_FFFF_FFFF_FFF0
+        }
+        d[8 * 32 + 31] = 0xf0;
+        d
+    }
+
+    #[test]
+    fn l6b_023_hostile_string_length_is_an_error_not_a_panic() {
+        let r = std::panic::catch_unwind(|| decode_get_model(&hostile_len()));
+        match r {
+            Ok(res) => assert!(res.is_err(), "hostile length must be rejected, got {res:?}"),
+            Err(_) => panic!("PBA-L6b-023: decode_get_model panicked on a hostile length word"),
+        }
+    }
+
+    #[test]
+    fn l6b_023_hostile_offset_is_an_error_not_a_panic() {
+        let mut d = hostile_len();
+        // word 4: offset = 0xFFFF_FFFF_FFFF_FFE0 (a multiple of 32 near u64::MAX).
+        for b in &mut d[4 * 32 + 24..4 * 32 + 32] {
+            *b = 0xff;
+        }
+        d[4 * 32 + 31] = 0xe0;
+        let r = std::panic::catch_unwind(|| decode_get_model(&d));
+        match r {
+            Ok(res) => assert!(res.is_err(), "hostile offset must be rejected, got {res:?}"),
+            Err(_) => panic!("PBA-L6b-023: decode_get_model panicked on a hostile offset word"),
+        }
+    }
+
+    // Mutation-hardening (PBA-L6b-023): the TooShort diagnostics are exact.
+    #[test]
+    fn too_short_errors_report_exact_word_counts() {
+        // 5 words: reading head word 7 (isActive) needs 8 words.
+        let mut d = synth_return([0x01; 20], "Qmshort", true);
+        d.truncate(5 * 32);
+        let e = decode_get_model(&d).unwrap_err();
+        assert_eq!(e, AbiError::TooShort { need: 8, got: 5 });
+        // CID length claims 70 bytes but only 2 tail words exist.
+        let mut d = synth_return([0x01; 20], "Qmshort", true);
+        let len_at = 352;
+        d[len_at + 31] = 70;
+        let got = d.len() / 32;
+        let e = decode_get_model(&d).unwrap_err();
+        assert_eq!(got, 13);
+        assert_eq!(e, AbiError::TooShort { need: 15, got: 13 });
     }
 }

@@ -88,6 +88,11 @@ pub const DEFAULT_MAX_JOB_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 /// The configured per-job input ceiling (env `CITRATE_MAX_JOB_INPUT_BYTES`,
 /// else [`DEFAULT_MAX_JOB_INPUT_BYTES`]). A value that a bid could not have
 /// accounted for is refused rather than run into a slash.
+/// Test-only: serializes every test that mutates `CITRATE_MAX_JOB_INPUT_BYTES`
+/// (process-global env), so parallel tests never observe each other's cap.
+#[cfg(test)]
+pub(crate) static INPUT_CAP_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub fn max_job_input_bytes() -> u64 {
     std::env::var("CITRATE_MAX_JOB_INPUT_BYTES")
         .ok()
@@ -290,6 +295,15 @@ fn validate_cid(cid: &str) -> Result<(), String> {
             "SECURITY [SVC-7]: rejecting model CID {cid:?}: unrecognized multibase/version prefix"
         ));
     }
+    // PBA-L6b-039 / NA-03: one CID grammar. The executor's fetch-time grammar
+    // (CIDv0 base58btc, or canonical base32lower CIDv1) is the source of truth;
+    // the checks above only keep their specific SVC-7 error messages.
+    if !executor::models::validate_cid(cid) {
+        return Err(format!(
+            "SECURITY [SVC-7]: rejecting model CID {cid:?}: not a CIDv0 (base58btc) or \
+             canonical base32lower CIDv1 (NA-03)"
+        ));
+    }
     Ok(())
 }
 
@@ -435,12 +449,82 @@ where
             None => self.nonce,
         };
 
+        // PBA-L6b-007 (NA-01 residual): the nonce alone does not survive a
+        // restart safely — the committed OUTPUT must too. Reload the persisted
+        // artifacts; if the job is committed on-chain (and still awaiting the
+        // reveal) but they are gone, re-running (sampled) inference would reveal
+        // an output that cannot match the commitment. Abort instead.
+        if progress.artifacts.is_none() {
+            if let Some(store) = &self.nonce_store {
+                match store.load_artifacts(self.job_id) {
+                    Ok(Some(art)) => {
+                        progress.nonce = Some(nonce_seed);
+                        progress.artifacts = Some(art);
+                    }
+                    Ok(None)
+                        if resolved.committed && resolved.job.state == JobState::Executing =>
+                    {
+                        return record_error(
+                            state,
+                            format!(
+                                "job {}: committed on-chain but the committed output was not \
+                                 persisted; refusing to re-run inference and reveal a mismatched \
+                                 output (NA-01 / PBA-L6b-007)",
+                                self.job_id
+                            ),
+                        )
+                        .await
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return record_error(
+                            state,
+                            format!("job {}: loading commitment artifacts: {e}", self.job_id),
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+
         // The RunInference step needs the off-chain input; nothing else does. If
         // we're about to run inference and the input hasn't arrived, hold.
         let need_input = resolved.job.state == JobState::Executing && progress.artifacts.is_none();
         let input = if need_input {
             match self.input.input_for(self.job_id).await {
-                Ok(Some(bytes)) => bytes,
+                Ok(Some(bytes)) => {
+                    // PBA-L6b-021: the off-chain delivery must be the input the
+                    // requester posted. `Job.inputHash` is `keccak256(input)`
+                    // (SDK default); anything else cannot be bound, so fail
+                    // closed rather than execute (and stake on) whatever file
+                    // landed in the input directory.
+                    match resolved.job.input_hash {
+                        Some(h) if executor::keccak256_bytes(&bytes) == h => bytes,
+                        Some(_) => {
+                            return record_error(
+                                state,
+                                format!(
+                                    "job {}: delivered input does not match the on-chain \
+                                     inputHash; refusing to execute (PBA-L6b-021)",
+                                    self.job_id
+                                ),
+                            )
+                            .await
+                        }
+                        None => {
+                            return record_error(
+                                state,
+                                format!(
+                                    "job {}: on-chain inputHash is not a 32-byte keccak256 \
+                                     binding; refusing to execute an unbindable input \
+                                     (PBA-L6b-021)",
+                                    self.job_id
+                                ),
+                            )
+                            .await
+                        }
+                    }
+                }
                 Ok(None) => return StepOutcome::AwaitingInput,
                 Err(e) => {
                     return record_error(state, format!("input for job {}: {e}", self.job_id)).await
@@ -464,7 +548,7 @@ where
             cache_dir: self.cache_dir.clone(),
         };
 
-        drive_job(
+        let outcome = drive_job(
             &ctx,
             &mut progress,
             state,
@@ -474,7 +558,24 @@ where
             nonce_seed,
             Some(&self.profiler),
         )
-        .await
+        .await;
+
+        // PBA-L6b-007: persist the fresh artifacts BEFORE the next step can emit
+        // `submitCommitment`. If the write fails, drop them from memory so the
+        // commitment is never emitted for an output a restart could not reveal.
+        if outcome == StepOutcome::RanInference {
+            if let (Some(store), Some(art)) = (&self.nonce_store, progress.artifacts.as_ref()) {
+                if let Err(e) = store.save_artifacts(self.job_id, art) {
+                    progress.artifacts = None;
+                    return record_error(
+                        state,
+                        format!("job {}: persisting commitment artifacts: {e}", self.job_id),
+                    )
+                    .await;
+                }
+            }
+        }
+        outcome
     }
 }
 
@@ -601,6 +702,7 @@ mod tests {
             execution_deadline_block: 1_000,
             created_at_block: 50,
             bid_count: 1,
+            input_hash: None,
         }
     }
 
@@ -730,6 +832,7 @@ mod tests {
     // than running it and blowing the execution deadline (the on-chain slash).
     #[tokio::test]
     async fn oversized_input_is_refused_before_running_inference() {
+        let _env = INPUT_CAP_ENV_LOCK.lock().await;
         std::env::set_var("CITRATE_MAX_JOB_INPUT_BYTES", "1024");
         let state = shared();
         let signer = UnsignedJobSigner::new();
@@ -812,6 +915,8 @@ mod tests {
     fn resolved_committed(state: JobState, assigned: Address, committed: bool) -> ResolvedJob {
         let mut j = job(state);
         j.assigned_provider = assigned;
+        // PBA-L6b-021: the posted inputHash binds the HasInput delivery.
+        j.input_hash = Some(executor::keccak256_bytes(b"the prompt"));
         ResolvedJob {
             job: j,
             // SECREM-01 SVC-7: real-shaped CIDv1 so the validate_cid guard passes.
@@ -949,6 +1054,12 @@ mod tests {
         );
         // No write was emitted.
         assert!(exec.signer.recorded().is_empty(), "no submitResult on abort");
+        // And no fresh nonce was minted for a job already committed on-chain.
+        assert_eq!(
+            crate::nonce::NonceStore::new(dir.clone()).load(7).unwrap(),
+            None,
+            "must not mint a replacement nonce after the commitment"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1075,6 +1186,59 @@ mod tests {
         }
     }
 
+    // PBA-L6b-039 / NA-03: one CID grammar. The pre-provision gate accepted
+    // shapes (base58 `z…`, base16 `f…`, uppercase `B…`/`F…`, `Qm` with 0/O/I/l)
+    // that the executor's fetch-time grammar refuses; the gate must be exactly
+    // as strict, so a job never runs up to provisioning on a CID it can't fetch.
+    #[test]
+    fn l6b_039_single_cid_grammar() {
+        for cid in [
+            format!("z{}", "a".repeat(50)),
+            format!("f{}", "0".repeat(70)),
+            format!("B{}", "A".repeat(58)),
+            format!("Qm{}", "0".repeat(44)), // '0' is not base58btc
+        ] {
+            assert!(validate_cid(&cid).is_err(), "{cid:?} must be refused");
+            assert!(!executor::models::validate_cid(&cid));
+        }
+    }
+
+    /// RFC 4648 lowercase base32, no padding (test-only encoder).
+    fn b32(bytes: &[u8]) -> String {
+        const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let (mut out, mut acc, mut n) = (String::new(), 0u32, 0u32);
+        for &b in bytes {
+            acc = (acc << 8) | b as u32;
+            n += 8;
+            while n >= 5 {
+                n -= 5;
+                out.push(A[((acc >> n) & 31) as usize] as char);
+            }
+            acc &= (1 << n) - 1;
+        }
+        if n > 0 {
+            out.push(A[((acc << (5 - n)) & 31) as usize] as char);
+        }
+        out
+    }
+
+    // The SVC-7 length ceiling is inclusive at 256 chars: a canonical CIDv1 of
+    // exactly 256 chars passes, 257 does not (mutation-hardening).
+    #[test]
+    fn validate_cid_length_ceiling_is_inclusive() {
+        // 159 bytes → 255 base32 chars (+ 'b' = 256); 160 bytes → 256 (+1 = 257).
+        let mut v = vec![0x01u8, 0x55, 0x12, 0x20];
+        v.resize(159, 0xab);
+        let at = format!("b{}", b32(&v));
+        assert_eq!(at.len(), 256);
+        assert!(executor::models::validate_cid(&at), "fixture is a canonical CIDv1");
+        assert!(validate_cid(&at).is_ok(), "256 chars is allowed");
+        v.push(0xab);
+        let over = format!("b{}", b32(&v));
+        assert_eq!(over.len(), 257);
+        assert!(validate_cid(&over).is_err(), "257 chars is over the ceiling");
+    }
+
     #[test]
     fn validate_cid_rejects_short_and_unprefixed() {
         assert!(validate_cid("bafycid").is_err()); // too short
@@ -1083,5 +1247,223 @@ mod tests {
         assert!(validate_cid(&"x".repeat(50)).is_err());
         // Over the length ceiling.
         assert!(validate_cid(&format!("b{}", "a".repeat(300))).is_err());
+    }
+
+    // ── PBA-L6b-007 (NA-01 residual): committed output must survive a restart ──
+
+    /// Sampled engine: every run yields a different output (llama-server with a
+    /// non-zero temperature / random seed). Counts runs so a test can assert
+    /// that inference was NOT re-run after a restart.
+    struct NonDet(std::sync::atomic::AtomicU64);
+    impl Inference for NonDet {
+        async fn run(
+            &self,
+            _m: &ProvisionedModel,
+            input: &[u8],
+        ) -> Result<InferenceOutput, InferenceError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut bytes = format!("sample-{n}:").into_bytes();
+            bytes.extend_from_slice(input);
+            Ok(InferenceOutput { bytes })
+        }
+    }
+
+    fn l6b_state_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "citrate-l6b007-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn l6b_exec(
+        dir: &std::path::Path,
+        committed: bool,
+        seed: u64,
+    ) -> JobExecutor<FakeView, HasInput, Weights, NonDet, UnsignedJobSigner> {
+        JobExecutor {
+            job_id: 7,
+            me: ME,
+            marketplace: MARKETPLACE,
+            chain_id: 40204,
+            cache_dir: dir.join(format!("cache-{seed}")),
+            // Never a fixed fixture: the persisted per-job nonce is what these
+            // tests exercise; the seed only matters when no store is present.
+            nonce: {
+                let mut n = <[u8; 32]>::default();
+                getrandom::getrandom(&mut n).expect("csprng");
+                n
+            },
+            nonce_store: Some(crate::nonce::NonceStore::new(dir.join("nonces"))),
+            view: FakeView(resolved_committed(JobState::Executing, ME, committed)),
+            input: HasInput,
+            weights: Weights,
+            inference: NonDet(std::sync::atomic::AtomicU64::new(seed)),
+            signer: UnsignedJobSigner::new(),
+            profiler: std::sync::Arc::new(ModelProfiler::new(6_000_000_000_000_000_000, 300)),
+            progress: tokio::sync::Mutex::new(JobProgress::default()),
+        }
+    }
+
+    // Inverted L6b PoC `l6b_na01_residual_restart_reveals_mismatched_output`:
+    // a restart between submitCommitment and submitResult must reveal the SAME
+    // output+nonce the chain committed to — reloaded from disk, never re-run.
+    #[tokio::test]
+    async fn l6b_007_restart_after_commit_reveals_the_committed_output() {
+        let state = shared();
+        let dir = l6b_state_dir("restart");
+        // process #1: infer, then emit submitCommitment (which lands on chain).
+        let p1 = l6b_exec(&dir, false, 0);
+        assert_eq!(p1.step(&state).await, StepOutcome::RanInference);
+        assert_eq!(
+            p1.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitCommitment)
+        );
+        let onchain = p1.progress.lock().await.artifacts.clone().unwrap();
+        drop(p1); // crash / update / reboot
+
+        // process #2: chain says committed=true.
+        let p2 = l6b_exec(&dir, true, 1000);
+        assert_eq!(
+            p2.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitResult),
+            "must reveal the persisted artifacts, not re-run inference"
+        );
+        assert_eq!(
+            p2.inference.0.load(std::sync::atomic::Ordering::SeqCst),
+            1000,
+            "inference must not run again after a restart"
+        );
+        let art2 = p2.progress.lock().await.artifacts.clone().unwrap();
+        let nonce: [u8; 32] = art2.proof[32..64].try_into().unwrap();
+        let recomputed = executor::CommitmentProver::commitment(&art2.proof[64..], &nonce);
+        assert_eq!(recomputed, onchain.commitment, "reveal reproduces the on-chain commitment");
+        assert_eq!(art2, onchain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Committed on-chain, nonce persisted, but the artifacts file is gone: the
+    // executor must abort (record an error) instead of re-running inference and
+    // revealing an output that cannot match the commitment.
+    #[tokio::test]
+    async fn l6b_007_committed_but_artifacts_missing_aborts_without_rerun() {
+        let state = shared();
+        let dir = l6b_state_dir("missing");
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        store.mint(7).unwrap(); // nonce survived, artifacts did not
+        let exec = l6b_exec(&dir, true, 0);
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("NA-01")),
+            "must abort, got {outcome:?}"
+        );
+        assert_eq!(
+            exec.inference.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "inference must not be re-run"
+        );
+        assert!(exec.signer.recorded().is_empty(), "no write on abort");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Verifier NEW-1: if the artifacts cannot be persisted (disk full, EACCES,
+    // ...), the in-memory output must be dropped and NO commitment emitted —
+    // a commitment to an output a restart cannot reveal is the L6b-007 slash.
+    // The failure is forced deterministically (also as root): the temp path is
+    // pre-created as a directory, so `save_artifacts` cannot replace it.
+    #[tokio::test]
+    async fn l6b_007_artifact_persist_failure_never_commits() {
+        let state = shared();
+        let dir = l6b_state_dir("savefail");
+        std::fs::create_dir_all(dir.join("nonces").join("artifacts-7.bin.tmp")).unwrap();
+        let exec = l6b_exec(&dir, false, 0);
+        let first = exec.step(&state).await;
+        assert!(
+            matches!(first, StepOutcome::Error(ref m) if m.contains("persisting commitment artifacts")),
+            "a failed persist must surface as an error, got {first:?}"
+        );
+        assert!(
+            exec.progress.lock().await.artifacts.is_none(),
+            "an output that was never persisted must not be kept in memory"
+        );
+        for _ in 0..3 {
+            let _ = exec.step(&state).await;
+        }
+        assert!(
+            !exec
+                .signer
+                .recorded()
+                .iter()
+                .any(|r| r.intent == WriteIntent::SubmitCommitment),
+            "no submitCommitment while the artifacts cannot be persisted"
+        );
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        assert!(
+            store.load_artifacts(7).unwrap().is_none(),
+            "nothing on disk either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The commitment is only emitted after the artifacts are durably on disk
+    // (0600), so no restart can observe a commitment without them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l6b_007_artifacts_are_persisted_0600_before_the_commitment() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = shared();
+        let dir = l6b_state_dir("perms");
+        let p1 = l6b_exec(&dir, false, 0);
+        assert_eq!(p1.step(&state).await, StepOutcome::RanInference);
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        let on_disk = store.load_artifacts(7).unwrap().expect("artifacts persisted");
+        assert_eq!(Some(on_disk), p1.progress.lock().await.artifacts.clone());
+        let mode = std::fs::metadata(store.artifacts_path(7))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── PBA-L6b-021: the off-chain input must match the on-chain inputHash ──
+
+    #[tokio::test]
+    async fn l6b_021_input_not_matching_onchain_input_hash_is_refused() {
+        let state = shared();
+        let mut rj = resolved(JobState::Executing, ME);
+        rj.job.input_hash = Some(executor::keccak256_bytes(b"what the requester posted"));
+        let exec = executor(rj, HasInput, "l6b021-mismatch");
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("inputHash")),
+            "a substituted input must be refused, got {outcome:?}"
+        );
+        assert!(exec.progress.lock().await.artifacts.is_none(), "no inference ran");
+        assert!(exec.signer.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn l6b_021_unbindable_input_hash_fails_closed() {
+        let state = shared();
+        let mut rj = resolved(JobState::Executing, ME);
+        rj.job.input_hash = None; // not a 32-byte keccak binding
+        let exec = executor(rj, HasInput, "l6b021-none");
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("inputHash")),
+            "an input that cannot be bound must be refused, got {outcome:?}"
+        );
+        assert!(exec.progress.lock().await.artifacts.is_none(), "no inference ran");
+    }
+
+    #[tokio::test]
+    async fn l6b_021_matching_input_runs() {
+        let state = shared();
+        let exec = executor(resolved(JobState::Executing, ME), HasInput, "l6b021-ok");
+        assert_eq!(exec.step(&state).await, StepOutcome::RanInference);
     }
 }

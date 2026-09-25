@@ -25,6 +25,8 @@ pub enum RpcError {
     MalformedResponse(String),
     /// Decoding the `result` hex / ABI failed.
     Abi(AbiError),
+    /// PBA-L6b-024: the endpoint redirected or sent an oversized body.
+    Refused(crate::outbound::CappedReadError),
 }
 
 impl core::fmt::Display for RpcError {
@@ -34,6 +36,7 @@ impl core::fmt::Display for RpcError {
             RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
             RpcError::MalformedResponse(s) => write!(f, "malformed rpc response: {s}"),
             RpcError::Abi(e) => write!(f, "rpc abi decode error: {e}"),
+            RpcError::Refused(e) => write!(f, "rpc response refused: {e}"),
         }
     }
 }
@@ -133,6 +136,23 @@ impl RpcClient {
         })
     }
 
+    /// POST a JSON-RPC envelope and parse the answer. PBA-L6b-024: redirects
+    /// are refused and the body is read through a hard cap
+    /// ([`crate::outbound::read_body_capped`]) instead of `Response::json`.
+    async fn post_capped(&self, req: &Value) -> Result<Value, RpcError> {
+        let resp = self
+            .http
+            .post(&self.url)
+            .json(req)
+            .send()
+            .await
+            .map_err(RpcError::Http)?;
+        let body = crate::outbound::read_body_capped(resp, crate::outbound::max_response_bytes())
+            .await
+            .map_err(RpcError::Refused)?;
+        serde_json::from_slice(&body).map_err(|e| RpcError::MalformedResponse(e.to_string()))
+    }
+
     fn next_id(&self) -> u64 {
         self.next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -141,16 +161,7 @@ impl RpcClient {
     /// Low-level: send a JSON-RPC method and return the `result` string.
     pub async fn call_raw(&self, method: &str, params: Value) -> Result<String, RpcError> {
         let req = build_request(self.next_id(), method, params);
-        let resp: Value = self
-            .http
-            .post(&self.url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(RpcError::Http)?
-            .json()
-            .await
-            .map_err(RpcError::Http)?;
+        let resp = self.post_capped(&req).await?;
         parse_result_string(&resp)
     }
 
@@ -181,16 +192,7 @@ impl RpcClient {
     /// object results like `eth_getBlockByNumber`).
     pub async fn call_raw_value(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let req = build_request(self.next_id(), method, params);
-        let resp: Value = self
-            .http
-            .post(&self.url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(RpcError::Http)?
-            .json()
-            .await
-            .map_err(RpcError::Http)?;
+        let resp = self.post_capped(&req).await?;
         parse_result_value(&resp)
     }
 

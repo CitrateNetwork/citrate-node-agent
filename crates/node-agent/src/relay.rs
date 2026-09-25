@@ -128,6 +128,7 @@ impl crate::daemon::BidPlacer for RelayBidPlacer {
         job_id: u128,
         price_wei: u128,
         estimated_latency_ms: u128,
+        expires_block: u128,
     ) -> Result<(), String> {
         let calldata =
             chainio::marketplace::encode_bid_on_job(job_id, price_wei, estimated_latency_ms);
@@ -139,7 +140,8 @@ impl crate::daemon::BidPlacer for RelayBidPlacer {
             0,
             self.chain_id,
             format!("bidOnJob job {job_id} at {price_wei} wei"),
-            0,
+            // PBA-L6b-025: the bid is only meaningful until the bid deadline.
+            expires_block,
         );
         // Queued for the signing surface — not broadcast here.
         Ok(())
@@ -230,10 +232,12 @@ mod tests {
         let state: SharedState = Arc::new(RwLock::new(AgentState::new()));
         let placer = RelayBidPlacer::new(state.clone(), [0x11; 20], 40204);
 
-        placer.place(7, 1_150_000, 600_000).await.expect("queued");
+        placer.place(7, 1_150_000, 600_000, 100).await.expect("queued");
         let reqs = state.read().await.signature_requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].intent, "bidOnJob");
+        // PBA-L6b-025: the unsigned bid expires at the job's bid deadline.
+        assert_eq!(reqs[0].expires_block, "100", "bid must carry the bid deadline");
         assert!(reqs[0].calldata.starts_with("0x18360fc2"), "pinned selector");
         assert_eq!(reqs[0].value_wei, "0");
         let first_calldata = reqs[0].calldata.clone();
@@ -244,7 +248,7 @@ mod tests {
         // id, but the newest calldata.
         for tick in 1..=240u128 {
             placer
-                .place(7, 1_150_000 + tick, 600_000 + tick)
+                .place(7, 1_150_000 + tick, 600_000 + tick, 100)
                 .await
                 .expect("supersede");
         }
@@ -255,7 +259,7 @@ mod tests {
 
         // A bid, once observed, must NOT re-arm (one-shot semantics).
         state.write().await.mark_request_observed(first_id, "0xbeef".into());
-        placer.place(7, 2_000_000, 700_000).await.expect("still submitted");
+        placer.place(7, 2_000_000, 700_000, 100).await.expect("still submitted");
         let reqs = state.read().await.signature_requests();
         assert_eq!(reqs.len(), 1, "no re-arm of a broadcast bid");
         assert_eq!(reqs[0].status, "submitted");

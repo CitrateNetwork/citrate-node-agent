@@ -212,6 +212,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (pflop_hours, exec_secs) = build_profiler().estimate(&job.model_hash);
     let bid_job = bridge::map_job(&job, current_block, secs_per_block, pflop_hours, exec_secs);
 
+    // PBA-L6b-021/025: the same open-for-bids gate the daemon applies (state,
+    // bid deadline, and a bindable 32-byte inputHash).
+    if bridge::bid_expires_block(&job, current_block).is_none() {
+        println!(
+            "DECISION: SKIP job #{} — not open for bids (state/deadline) or its inputHash cannot be bound to the input",
+            job.id
+        );
+        return Ok(());
+    }
+
     // 4. Decision.
     let decision = bidder::evaluate(&bid_job, &oracle, &bid_settings, &caps);
     match decision {
@@ -245,19 +255,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// sends heartbeats on the heartbeat cadence — respecting `/pause`. No real job
 /// execution yet (SELL-S2); the state machine + supervision are real.
 async fn run_daemon(config_path: &str, job_id: u128) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Config → bidder settings (sampled clock for the schedule gate).
-    let raw = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("reading {config_path}: {e}"))?;
-    let settings = ComputeSettings::from_json(&raw)?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let (hour, minute, weekday) = clock::utc_hour_min_weekday(now);
-    let bid_settings = Settings {
-        enabled: settings.enabled,
-        schedule: settings.schedule,
-        current_hour: hour,
-        current_min: minute,
-        current_day: weekday,
+    // 1. Config → bidder settings. PBA-L6b-008: `LiveSettings` re-reads
+    //    compute.json and re-samples the clock on EVERY tick, so the schedule /
+    //    window-close gates track real time and operator edits apply without a
+    //    restart. Validate once up front so a broken config still fails startup.
+    let bid_settings = daemon::LiveSettings {
+        config_path: std::path::PathBuf::from(config_path),
+        now: || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        },
     };
+    daemon::SettingsSource::current(&bid_settings)?;
 
     // 2. Shared state + supervision server (loopback only).
     let state: supervision::SharedState = Arc::new(RwLock::new(supervision::AgentState::new()));

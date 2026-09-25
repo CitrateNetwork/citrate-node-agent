@@ -335,6 +335,7 @@ mod tests {
             execution_deadline_block: exec_deadline,
             created_at_block: 50,
             bid_count: 1,
+            input_hash: None,
         }
     }
 

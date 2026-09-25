@@ -79,6 +79,11 @@ pub trait Inference {
     ) -> impl std::future::Future<Output = Result<InferenceOutput, InferenceError>> + Send;
 }
 
+/// PBA-L6b-007: the fixed sampling seed sent with every completion. Together
+/// with `temperature: 0` (greedy decoding) it makes a re-run reproduce the same
+/// output, so a restart can never reveal an output the commitment did not bind.
+pub const LLAMA_FIXED_SEED: u32 = 40204;
+
 /// Resident llama.cpp (`llama-server`) adapter — POSTs `{base_url}/completion`.
 pub struct LlamaServerInference {
     base_url: String,
@@ -157,7 +162,15 @@ impl Inference for LlamaServerInference {
             }
         }
         let prompt = String::from_utf8_lossy(input).into_owned();
-        let body = serde_json::json!({ "prompt": prompt, "n_predict": 512 });
+        // PBA-L6b-007: greedy decoding + a fixed seed, so the output is
+        // reproducible and a post-restart re-run can never diverge from the
+        // committed output.
+        let body = serde_json::json!({
+            "prompt": prompt,
+            "n_predict": 512,
+            "temperature": 0.0,
+            "seed": LLAMA_FIXED_SEED,
+        });
         let url = format!("{}/completion", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
@@ -169,9 +182,12 @@ impl Inference for LlamaServerInference {
         if !resp.status().is_success() {
             return Err(InferenceError::Backend(format!("server status {}", resp.status())));
         }
-        let v: serde_json::Value = resp
-            .json()
+        // PBA-L6b-024: capped body read (redirects refused by the client and
+        // again here), never an unbounded `Response::json`.
+        let body = chainio::outbound::read_body_capped(resp, chainio::outbound::max_response_bytes())
             .await
+            .map_err(|e| InferenceError::Backend(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| InferenceError::Backend(e.to_string()))?;
         let content = v
             .get("content")
