@@ -77,8 +77,95 @@ pub fn timed_http_client() -> reqwest::Client {
             DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
         ))
         .timeout(secs_from_env(HTTP_TIMEOUT_ENV, DEFAULT_HTTP_TIMEOUT_SECS))
+        // PBA-L6b-024: never follow a redirect — see `no_redirect_fallback`.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| no_redirect_fallback())
+}
+
+/// PBA-L6b-024: the https/loopback gate ([`validate_outbound_url`]) is checked
+/// once, on the configured URL. reqwest's default redirect policy
+/// (`limited(10)`) would then follow a 3xx to any scheme or host — https to
+/// plaintext http, or to an internal service — silently bypassing the gate. So
+/// every outbound client refuses redirects. If the tuned builder cannot be
+/// built, the fallback keeps that policy; only if even that fails does it fall
+/// back to `Client::new()` (which panics on the same TLS-init failure, so the
+/// redirect-following default is never actually reached in a running daemon).
+fn no_redirect_fallback() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// PBA-L6b-024: default cap on a small-response body (JSON-RPC answers, the
+/// inference completion). Overridable via `CITRATE_MAX_RESPONSE_BYTES`.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Env var overriding [`DEFAULT_MAX_RESPONSE_BYTES`].
+pub const MAX_RESPONSE_BYTES_ENV: &str = "CITRATE_MAX_RESPONSE_BYTES";
+
+/// The configured small-response body cap.
+pub fn max_response_bytes() -> usize {
+    std::env::var(MAX_RESPONSE_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
+}
+
+/// Why a capped response read was refused.
+#[derive(Debug)]
+pub enum CappedReadError {
+    /// The server answered with a redirect; redirects are never followed.
+    Redirect(reqwest::StatusCode),
+    /// The body (declared or streamed) exceeds the cap.
+    TooLarge { max: usize },
+    /// Transport error while streaming the body.
+    Http(reqwest::Error),
+}
+
+impl core::fmt::Display for CappedReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CappedReadError::Redirect(s) => write!(
+                f,
+                "endpoint answered with redirect {s}; redirects are refused (PBA-L6b-024)"
+            ),
+            CappedReadError::TooLarge { max } => write!(
+                f,
+                "response body exceeds the {max}-byte cap (PBA-L6b-024)"
+            ),
+            CappedReadError::Http(e) => write!(f, "reading response body: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CappedReadError {}
+
+/// PBA-L6b-024: read a response body with a hard byte cap, refusing a redirect
+/// status first. Rejects an oversized `Content-Length` up front and stops
+/// streaming as soon as the running total would pass `max`, so a hostile or
+/// compromised endpoint cannot make the daemon buffer an unbounded body.
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, CappedReadError> {
+    if resp.status().is_redirection() {
+        return Err(CappedReadError::Redirect(resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > max as u64 {
+            return Err(CappedReadError::TooLarge { max });
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(CappedReadError::Http)? {
+        if buf.len().saturating_add(chunk.len()) > max {
+            return Err(CappedReadError::TooLarge { max });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Build a reqwest client with connect + per-read (inactivity) timeouts, for the
@@ -95,8 +182,10 @@ pub fn streaming_http_client() -> reqwest::Client {
             HTTP_READ_TIMEOUT_ENV,
             DEFAULT_HTTP_READ_TIMEOUT_SECS,
         ))
+        // PBA-L6b-024: never follow a redirect (see `no_redirect_fallback`).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| no_redirect_fallback())
 }
 
 /// Why an outbound endpoint URL was refused.

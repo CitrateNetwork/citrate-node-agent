@@ -182,9 +182,12 @@ impl Inference for LlamaServerInference {
         if !resp.status().is_success() {
             return Err(InferenceError::Backend(format!("server status {}", resp.status())));
         }
-        let v: serde_json::Value = resp
-            .json()
+        // PBA-L6b-024: capped body read (redirects refused by the client and
+        // again here), never an unbounded `Response::json`.
+        let body = chainio::outbound::read_body_capped(resp, chainio::outbound::max_response_bytes())
             .await
+            .map_err(|e| InferenceError::Backend(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| InferenceError::Backend(e.to_string()))?;
         let content = v
             .get("content")
