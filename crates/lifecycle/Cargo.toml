@@ -15,3 +15,6 @@ chainio = { path = "../chainio" }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# compat_anvil_settlement.rs (env-gated live test): JSON-RPC params + keccak.
+serde_json = { workspace = true }
+tiny-keccak = { workspace = true }

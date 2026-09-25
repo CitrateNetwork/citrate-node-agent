@@ -592,6 +592,8 @@ name = "lifecycle"
 version = "0.1.0"
 dependencies = [
  "chainio",
+ "serde_json",
+ "tiny-keccak",
  "tokio",
 ]
 
