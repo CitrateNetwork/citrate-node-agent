@@ -100,7 +100,10 @@ async fn rpc_client_caps_the_response_body() {
 
 #[tokio::test]
 async fn rpc_client_still_reads_a_normal_answer() {
-    let url = serve(ok_json(r#"{"jsonrpc":"2.0","id":1,"result":"0x9d0c"}"#), None);
+    let url = serve(
+        ok_json(r#"{"jsonrpc":"2.0","id":1,"result":"0x9d0c"}"#),
+        None,
+    );
     let client = RpcClient::new(url).expect("loopback http is allowed");
     assert_eq!(client.eth_chain_id().await.expect("ok"), 40204);
 }

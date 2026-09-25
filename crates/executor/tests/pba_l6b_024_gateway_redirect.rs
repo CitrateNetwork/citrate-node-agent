@@ -42,7 +42,10 @@ async fn gateway_fetch_does_not_follow_redirects() {
     let res = src
         .fetch("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
         .await;
-    assert!(res.is_err(), "PBA-L6b-024: gateway redirect must not be followed");
+    assert!(
+        res.is_err(),
+        "PBA-L6b-024: gateway redirect must not be followed"
+    );
     assert!(
         !hit.load(Ordering::SeqCst),
         "PBA-L6b-024: the redirect target must never be contacted"
