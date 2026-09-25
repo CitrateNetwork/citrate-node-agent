@@ -107,3 +107,13 @@ async fn rpc_client_still_reads_a_normal_answer() {
     let client = RpcClient::new(url).expect("loopback http is allowed");
     assert_eq!(client.eth_chain_id().await.expect("ok"), 40204);
 }
+
+#[tokio::test]
+async fn rpc_object_results_still_decode_through_the_capped_path() {
+    let url = serve(
+        ok_json(r#"{"jsonrpc":"2.0","id":1,"result":{"timestamp":"0x10"}}"#),
+        None,
+    );
+    let client = RpcClient::new(url).expect("loopback http is allowed");
+    assert_eq!(client.eth_block_timestamp(5).await.expect("ok"), 16);
+}
