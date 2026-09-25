@@ -653,6 +653,7 @@ dependencies = [
  "executor",
  "getrandom 0.2.17",
  "heartbeat",
+ "libc",
  "lifecycle",
  "supervision",
  "tokio",
