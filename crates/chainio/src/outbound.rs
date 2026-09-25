@@ -392,4 +392,93 @@ mod tests {
         assert_eq!(host_of("::1:8545"), None); // unbracketed v6 → fail closed
         assert_eq!(host_of(""), None);
     }
+
+    // ── PBA-L6b-024 mutation-hardening ──
+
+    /// Serve `resp` (raw HTTP) to every connection on a loopback port.
+    fn serve_raw(resp: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut s) = c else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(&resp);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn sized(body: &[u8], chunked: bool) -> Vec<u8> {
+        let mut r = if chunked {
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                body.len()
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+        };
+        r.extend_from_slice(body);
+        if chunked {
+            r.extend_from_slice(b"\r\n0\r\n\r\n");
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_boundaries_declared_and_streamed() {
+        let client = timed_http_client();
+        for chunked in [false, true] {
+            // Exactly the cap: accepted.
+            let url = serve_raw(sized(&[b'x'; 10], chunked));
+            let resp = client.get(&url).send().await.unwrap();
+            let b = read_body_capped(resp, 10).await.expect("exactly max is allowed");
+            assert_eq!(b.len(), 10, "chunked={chunked}");
+            // One over: refused.
+            let url = serve_raw(sized(&[b'x'; 11], chunked));
+            let resp = client.get(&url).send().await.unwrap();
+            assert!(
+                matches!(read_body_capped(resp, 10).await, Err(CappedReadError::TooLarge { max: 10 })),
+                "chunked={chunked}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_client_constructor_follows_redirects() {
+        let target = serve_raw(sized(b"reached", false));
+        let redirect = serve_raw(
+            format!("HTTP/1.1 302 Found\r\nLocation: {target}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        );
+        for (name, c) in [
+            ("timed", timed_http_client()),
+            ("streaming", streaming_http_client()),
+            ("fallback", no_redirect_fallback()),
+        ] {
+            let resp = c.get(&redirect).send().await.unwrap();
+            assert!(resp.status().is_redirection(), "{name} followed the redirect");
+            assert!(matches!(
+                read_body_capped(resp, 1024).await,
+                Err(CappedReadError::Redirect(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn max_response_bytes_env_override_and_zero_fallback() {
+        std::env::set_var(MAX_RESPONSE_BYTES_ENV, "5");
+        assert_eq!(max_response_bytes(), 5);
+        std::env::set_var(MAX_RESPONSE_BYTES_ENV, "0");
+        assert_eq!(max_response_bytes(), DEFAULT_MAX_RESPONSE_BYTES);
+        std::env::remove_var(MAX_RESPONSE_BYTES_ENV);
+        assert_eq!(max_response_bytes(), DEFAULT_MAX_RESPONSE_BYTES);
+    }
 }

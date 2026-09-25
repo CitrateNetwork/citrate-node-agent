@@ -227,4 +227,22 @@ mod tests {
             Err(_) => panic!("PBA-L6b-023: decode_get_model panicked on a hostile offset word"),
         }
     }
+
+    // Mutation-hardening (PBA-L6b-023): the TooShort diagnostics are exact.
+    #[test]
+    fn too_short_errors_report_exact_word_counts() {
+        // 5 words: reading head word 7 (isActive) needs 8 words.
+        let mut d = synth_return([0x01; 20], "Qmshort", true);
+        d.truncate(5 * 32);
+        let e = decode_get_model(&d).unwrap_err();
+        assert_eq!(e, AbiError::TooShort { need: 8, got: 5 });
+        // CID length claims 70 bytes but only 2 tail words exist.
+        let mut d = synth_return([0x01; 20], "Qmshort", true);
+        let len_at = 352;
+        d[len_at + 31] = 70;
+        let got = d.len() / 32;
+        let e = decode_get_model(&d).unwrap_err();
+        assert_eq!(got, 13);
+        assert_eq!(e, AbiError::TooShort { need: 15, got: 13 });
+    }
 }

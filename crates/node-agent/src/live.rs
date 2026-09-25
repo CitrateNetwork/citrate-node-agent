@@ -356,6 +356,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // PBA-L6b-022 mutation-hardening: exact cap boundary, absent file, and the
+    // symlink-vs-other-error diagnostics.
+    #[test]
+    fn capped_read_boundaries_absent_and_diagnostics() {
+        let dir = std::env::temp_dir().join(format!("l6b022-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("1.bin");
+        assert_eq!(read_capped_regular_file(&p, 8), Ok(None), "not delivered yet");
+        std::fs::write(&p, [7u8; 8]).unwrap();
+        assert_eq!(read_capped_regular_file(&p, 8), Ok(Some(vec![7u8; 8])), "exactly max");
+        assert!(read_capped_regular_file(&p, 7).is_err(), "one over max");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let link = dir.join("2.bin");
+            std::os::unix::fs::symlink(&p, &link).unwrap();
+            let e = read_capped_regular_file(&link, 8).unwrap_err();
+            assert!(e.contains("symlink"), "symlink diagnosed: {e}");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::File::open(&p).is_err() {
+                let e = read_capped_regular_file(&p, 8).unwrap_err();
+                assert!(!e.contains("symlink"), "EACCES is not a symlink: {e}");
+            }
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // PBA-L6b-039 / NA-04: the fallback nonce comes from the OS CSPRNG.
     #[test]
     fn random_nonce_is_fresh_csprng_output() {

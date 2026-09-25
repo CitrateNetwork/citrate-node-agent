@@ -1054,6 +1054,12 @@ mod tests {
         );
         // No write was emitted.
         assert!(exec.signer.recorded().is_empty(), "no submitResult on abort");
+        // And no fresh nonce was minted for a job already committed on-chain.
+        assert_eq!(
+            crate::nonce::NonceStore::new(dir.clone()).load(7).unwrap(),
+            None,
+            "must not mint a replacement nonce after the commitment"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1195,6 +1201,42 @@ mod tests {
             assert!(validate_cid(&cid).is_err(), "{cid:?} must be refused");
             assert!(!executor::models::validate_cid(&cid));
         }
+    }
+
+    /// RFC 4648 lowercase base32, no padding (test-only encoder).
+    fn b32(bytes: &[u8]) -> String {
+        const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let (mut out, mut acc, mut n) = (String::new(), 0u32, 0u32);
+        for &b in bytes {
+            acc = (acc << 8) | b as u32;
+            n += 8;
+            while n >= 5 {
+                n -= 5;
+                out.push(A[((acc >> n) & 31) as usize] as char);
+            }
+            acc &= (1 << n) - 1;
+        }
+        if n > 0 {
+            out.push(A[((acc << (5 - n)) & 31) as usize] as char);
+        }
+        out
+    }
+
+    // The SVC-7 length ceiling is inclusive at 256 chars: a canonical CIDv1 of
+    // exactly 256 chars passes, 257 does not (mutation-hardening).
+    #[test]
+    fn validate_cid_length_ceiling_is_inclusive() {
+        // 159 bytes → 255 base32 chars (+ 'b' = 256); 160 bytes → 256 (+1 = 257).
+        let mut v = vec![0x01u8, 0x55, 0x12, 0x20];
+        v.resize(159, 0xab);
+        let at = format!("b{}", b32(&v));
+        assert_eq!(at.len(), 256);
+        assert!(executor::models::validate_cid(&at), "fixture is a canonical CIDv1");
+        assert!(validate_cid(&at).is_ok(), "256 chars is allowed");
+        v.push(0xab);
+        let over = format!("b{}", b32(&v));
+        assert_eq!(over.len(), 257);
+        assert!(validate_cid(&over).is_err(), "257 chars is over the ceiling");
     }
 
     #[test]

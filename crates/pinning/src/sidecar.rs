@@ -307,4 +307,54 @@ mod tests {
         let post = sealer.prove_post(&inputs, 1).await.expect("prove_post");
         assert!(!post.is_empty());
     }
+
+    // ── PBA-L6b-039 mutation-hardening: the sidecar protocol + budget ──
+
+    #[cfg(unix)]
+    fn fake_sealer(tag: &str, script: &str) -> (SidecarSealer, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("l6b039-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("citrate-sealer");
+        std::fs::write(&bin, format!("#!/bin/sh\ncat >/dev/null\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (
+            SidecarSealer::new(&bin).unwrap().with_timeout(std::time::Duration::from_secs(20)),
+            dir,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_accepts_ok_true_and_rejects_ok_false_and_bad_exit() {
+        let (s, d) = fake_sealer("ok", r#"echo '{"ok":true,"proof":"0x01"}'"#);
+        let v = s.call("{}".into()).await.expect("ok:true is success");
+        assert_eq!(v["proof"], "0x01");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let (s, d) = fake_sealer("okfalse", r#"echo '{"ok":false,"error":"boom"}'"#);
+        let e = s.call("{}".into()).await.unwrap_err();
+        assert!(format!("{e:?}").contains("boom"));
+        let _ = std::fs::remove_dir_all(&d);
+
+        let (s, d) = fake_sealer("exit1", r#"echo '{"ok":true}'; exit 1"#);
+        assert!(s.call("{}".into()).await.is_err(), "non-zero exit is an error");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sealer_timeout_env_override_and_zero_fallback() {
+        std::env::set_var("CITRATE_SEALER_TIMEOUT_SECS", "5");
+        assert_eq!(sealer_timeout_from_env(), std::time::Duration::from_secs(5));
+        std::env::set_var("CITRATE_SEALER_TIMEOUT_SECS", "0");
+        assert_eq!(
+            sealer_timeout_from_env(),
+            std::time::Duration::from_secs(DEFAULT_SEALER_TIMEOUT_SECS)
+        );
+        std::env::remove_var("CITRATE_SEALER_TIMEOUT_SECS");
+        assert_eq!(
+            sealer_timeout_from_env(),
+            std::time::Duration::from_secs(DEFAULT_SEALER_TIMEOUT_SECS)
+        );
+    }
 }

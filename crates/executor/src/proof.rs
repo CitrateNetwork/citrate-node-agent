@@ -186,4 +186,21 @@ mod tests {
         tampered[last] ^= 0xff;
         assert!(!on_chain_verify(&art.commitment, &tampered));
     }
+
+    // PBA-L6b-021: keccak256_bytes is real Keccak-256 (known vectors), so the
+    // inputHash binding compares against what the SDK actually posts.
+    #[test]
+    fn keccak256_bytes_known_vectors() {
+        fn hex(b: &[u8; 32]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        assert_eq!(
+            hex(&keccak256_bytes(b"")),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+        assert_eq!(
+            hex(&keccak256_bytes(b"abc")),
+            "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+        );
+    }
 }
