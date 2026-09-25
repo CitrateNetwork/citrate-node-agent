@@ -1290,7 +1290,13 @@ mod tests {
             marketplace: MARKETPLACE,
             chain_id: 40204,
             cache_dir: dir.join(format!("cache-{seed}")),
-            nonce: [0x42; 32],
+            // Never a fixed fixture: the persisted per-job nonce is what these
+            // tests exercise; the seed only matters when no store is present.
+            nonce: {
+                let mut n = <[u8; 32]>::default();
+                getrandom::getrandom(&mut n).expect("csprng");
+                n
+            },
             nonce_store: Some(crate::nonce::NonceStore::new(dir.join("nonces"))),
             view: FakeView(resolved_committed(JobState::Executing, ME, committed)),
             input: HasInput,
@@ -1360,6 +1366,45 @@ mod tests {
             "inference must not be re-run"
         );
         assert!(exec.signer.recorded().is_empty(), "no write on abort");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Verifier NEW-1: if the artifacts cannot be persisted (disk full, EACCES,
+    // ...), the in-memory output must be dropped and NO commitment emitted —
+    // a commitment to an output a restart cannot reveal is the L6b-007 slash.
+    // The failure is forced deterministically (also as root): the temp path is
+    // pre-created as a directory, so `save_artifacts` cannot replace it.
+    #[tokio::test]
+    async fn l6b_007_artifact_persist_failure_never_commits() {
+        let state = shared();
+        let dir = l6b_state_dir("savefail");
+        std::fs::create_dir_all(dir.join("nonces").join("artifacts-7.bin.tmp")).unwrap();
+        let exec = l6b_exec(&dir, false, 0);
+        let first = exec.step(&state).await;
+        assert!(
+            matches!(first, StepOutcome::Error(ref m) if m.contains("persisting commitment artifacts")),
+            "a failed persist must surface as an error, got {first:?}"
+        );
+        assert!(
+            exec.progress.lock().await.artifacts.is_none(),
+            "an output that was never persisted must not be kept in memory"
+        );
+        for _ in 0..3 {
+            let _ = exec.step(&state).await;
+        }
+        assert!(
+            !exec
+                .signer
+                .recorded()
+                .iter()
+                .any(|r| r.intent == WriteIntent::SubmitCommitment),
+            "no submitCommitment while the artifacts cannot be persisted"
+        );
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        assert!(
+            store.load_artifacts(7).unwrap().is_none(),
+            "nothing on disk either"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

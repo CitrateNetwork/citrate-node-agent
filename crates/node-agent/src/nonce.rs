@@ -65,11 +65,7 @@ impl NonceStore {
     pub fn load(&self, job_id: u128) -> std::io::Result<Option<[u8; 32]>> {
         let path = self.path_for(job_id);
         match std::fs::read(&path) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut n = [0u8; 32];
-                n.copy_from_slice(&bytes);
-                Ok(Some(n))
-            }
+            Ok(bytes) if bytes.len() == 32 => Ok(<[u8; 32]>::try_from(bytes.as_slice()).ok()),
             Ok(bytes) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -89,7 +85,7 @@ impl NonceStore {
     pub fn mint(&self, job_id: u128) -> std::io::Result<[u8; 32]> {
         std::fs::create_dir_all(&self.dir)?;
         harden_dir_perms(&self.dir)?;
-        let mut nonce = [0u8; 32];
+        let mut nonce = <[u8; 32]>::default();
         getrandom::getrandom(&mut nonce)
             .map_err(|e| std::io::Error::other(format!("csprng: {e}")))?;
         write_new_0600(&self.path_for(job_id), &nonce)?;
@@ -159,8 +155,9 @@ impl NonceStore {
         if proof.len() < 64 {
             return Err(corrupt("shorter than commitment ‖ nonce"));
         }
-        let mut nonce = [0u8; 32];
-        nonce.copy_from_slice(&proof[32..64]);
+        let nonce: [u8; 32] = proof[32..64]
+            .try_into()
+            .map_err(|_| corrupt("nonce slice"))?;
         let rebuilt = CommitmentProver.build(&proof[64..], nonce);
         if rebuilt.proof != proof {
             return Err(corrupt("commitment does not match keccak256(output ‖ nonce)"));
@@ -280,10 +277,24 @@ mod tests {
         CommitmentProver.build(output, nonce)
     }
 
+    /// Mint job `id`'s nonce and return it as READ BACK from the store (the
+    /// value a restarted process would see), not the in-memory mint result.
+    fn minted(store: &NonceStore, id: u128) -> [u8; 32] {
+        store.mint(id).unwrap();
+        store.load(id).unwrap().expect("minted nonce is persisted")
+    }
+
+    /// A foreign nonce drawn from the OS CSPRNG (never a fixed fixture).
+    fn random_nonce() -> [u8; 32] {
+        let mut n = <[u8; 32]>::default();
+        getrandom::getrandom(&mut n).unwrap();
+        n
+    }
+
     #[test]
     fn artifacts_roundtrip_including_empty_output() {
         let store = temp_store("art-rt");
-        let n = store.mint(1).unwrap();
+        let n = minted(&store, 1);
         for out in [b"".as_slice(), b"hello".as_slice()] {
             let a = art(out, n);
             store.save_artifacts(1, &a).unwrap();
@@ -296,7 +307,7 @@ mod tests {
     #[test]
     fn artifacts_size_cap_is_exact() {
         let store = temp_store("art-cap");
-        let n = store.mint(1).unwrap();
+        let n = minted(&store, 1);
         let a = art(b"0123456789", n);
         store.save_artifacts(1, &a).unwrap();
         let len = a.proof.len() as u64;
@@ -318,7 +329,7 @@ mod tests {
     #[test]
     fn tampered_or_foreign_nonce_artifacts_are_rejected() {
         let store = temp_store("art-tamper");
-        let n = store.mint(1).unwrap();
+        let n = minted(&store, 1);
         // Output tampered after the commitment was computed.
         let mut a = art(b"out", n);
         let last = a.proof.len() - 1;
@@ -326,8 +337,9 @@ mod tests {
         std::fs::write(store.artifacts_path(1), &a.proof).unwrap();
         assert!(store.load_artifacts(1).is_err(), "commitment mismatch");
         // Internally consistent, but committed under a different nonce.
-        let foreign = art(b"out", [0x99; 32]);
-        assert_ne!(n, [0x99; 32]);
+        let other = random_nonce();
+        assert_ne!(n, other);
+        let foreign = art(b"out", other);
         std::fs::write(store.artifacts_path(1), &foreign.proof).unwrap();
         assert!(store.load_artifacts(1).is_err(), "nonce mismatch");
         let _ = std::fs::remove_dir_all(&store.dir);
@@ -338,7 +350,7 @@ mod tests {
     fn unreadable_artifacts_file_is_an_error_not_absent() {
         use std::os::unix::fs::PermissionsExt;
         let store = temp_store("art-perm");
-        let n = store.mint(1).unwrap();
+        let n = minted(&store, 1);
         store.save_artifacts(1, &art(b"x", n)).unwrap();
         let p = store.artifacts_path(1);
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
