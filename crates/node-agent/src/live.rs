@@ -124,6 +124,37 @@ impl JobView for LiveJobView {
             chainio::verifier::live::commitment_submitted(&self.client, self.verifier, job_id)
                 .await
                 .map_err(|e| format!("getRecord: {e}"))?;
+        // Settlement gates: effective tier, commitment block, and the
+        // dispute-window inputs for completeJob. Read failures leave the
+        // fail-safe defaults (the planner then waits / derives the tier).
+        let job_id_ = job.id;
+        let gates = lifecycle::ChainGates {
+            effective_tier: chainio::verifier::live::record_tier(&self.client, self.verifier, job_id_)
+                .await
+                .ok(),
+            commitment_block: if committed {
+                chainio::verifier::live::commitment_block(&self.client, self.verifier, job_id_)
+                    .await
+                    .map_err(|e| format!("commitmentBlock: {e}"))?
+            } else {
+                0
+            },
+            result_verified_at: chainio::marketplace::live::result_verified_at(
+                &self.client,
+                self.marketplace,
+                job_id_,
+            )
+            .await
+            .map_err(|e| format!("resultVerifiedAt: {e}"))?,
+            dispute_resolved_for_provider:
+                chainio::marketplace::live::dispute_resolved_for_provider(
+                    &self.client,
+                    self.marketplace,
+                    job_id_,
+                )
+                .await
+                .map_err(|e| format!("disputeResolvedForProvider: {e}"))?,
+        };
         Ok(ResolvedJob {
             job,
             ipfs_cid: model.ipfs_cid,
@@ -132,7 +163,7 @@ impl JobView for LiveJobView {
             expected_sha256: self.weights_sha256, // SECREM-01 SVC-2
             current_block,
             committed,
-            gates: lifecycle::ChainGates::default(),
+            gates,
         })
     }
 }

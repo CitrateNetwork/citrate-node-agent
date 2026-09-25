@@ -220,6 +220,16 @@ pub enum AbortReason {
 /// unsigned write, a request to run inference, or a terminal/abort signal.
 pub fn plan(input: &PlanInput) -> LifecycleAction {
     let job = input.job;
+    // Only the Commitment tier is provable by this agent. A job verified under
+    // ZKProof / TEE (including a Commitment request auto-upgraded above
+    // 10 SALT) is refused before any write is emitted for it.
+    if matches!(
+        job.state,
+        JobState::Assigned | JobState::Executing | JobState::Verifying
+    ) && effective_tier(input) != VerificationTier::Commitment
+    {
+        return LifecycleAction::Abort(AbortReason::UnsupportedTier);
+    }
     match job.state {
         // The bidder owns these phases; the lifecycle driver stays out.
         JobState::Posted | JobState::Bidding => LifecycleAction::Idle,
@@ -251,6 +261,12 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.current_block > job.execution_deadline_block {
                 return LifecycleAction::Abort(AbortReason::ExecutionDeadlinePassed);
             }
+            // The reveal must land in a later block than the commitment; with
+            // the head still at the commitment block, wait one block.
+            let commit_block = input.gates.commitment_block;
+            if commit_block != 0 && input.current_block <= commit_block {
+                return LifecycleAction::Wait(WaitReason::RevealAfterCommitBlock { commit_block });
+            }
             sign(
                 WriteIntent::SubmitResult,
                 encode_submit_result(job.id, &art.output_hash, &art.proof),
@@ -264,6 +280,19 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.me != job.assigned_provider {
                 return LifecycleAction::Abort(AbortReason::NotAssignedProvider);
             }
+            // `completeJob` is accepted only once the dispute window after the
+            // Valid verification has elapsed (or a dispute was resolved for
+            // the provider). Emitting it earlier is a guaranteed revert.
+            if !input.gates.dispute_resolved_for_provider {
+                let verified_at = input.gates.result_verified_at;
+                if verified_at == 0 {
+                    return LifecycleAction::Wait(WaitReason::AwaitingVerification);
+                }
+                let ready_at_block = verified_at.saturating_add(DISPUTE_WINDOW_BLOCKS);
+                if input.current_block < ready_at_block {
+                    return LifecycleAction::Wait(WaitReason::DisputeWindow { ready_at_block });
+                }
+            }
             sign(WriteIntent::CompleteJob, encode_complete_job(job.id), input)
         }
 
@@ -273,6 +302,22 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
         JobState::Failed => LifecycleAction::Abort(AbortReason::JobFailedOnChain),
         JobState::Disputed => LifecycleAction::Abort(AbortReason::JobDisputed),
     }
+}
+
+/// The tier the job is settled under: the verifier's record when read, else
+/// derived from the requested tier and `maxPrice` exactly as
+/// `ComputeVerifier.configureJob` does (Commitment above 10 SALT → ZKProof).
+pub fn effective_tier(input: &PlanInput) -> VerificationTier {
+    if let Some(t) = input.gates.effective_tier {
+        return t;
+    }
+    let job = input.job;
+    if job.tier == VerificationTier::Commitment
+        && job.max_price_wei > COMMITMENT_TIER_VALUE_THRESHOLD_WEI
+    {
+        return VerificationTier::ZKProof;
+    }
+    job.tier
 }
 
 /// Wrap a built calldata into an unsigned [`SignatureRequest`] for `intent`.
