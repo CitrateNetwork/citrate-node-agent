@@ -24,6 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
+use executor::{CommitmentProver, ProofMaker};
+use lifecycle::CommitmentArtifacts;
+
 /// Persists one 32-byte commitment nonce per job id under a `0700` state dir.
 #[derive(Debug, Clone)]
 pub struct NonceStore {
@@ -88,11 +91,90 @@ impl NonceStore {
         harden_dir_perms(&self.dir)?;
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("csprng: {e}")))?;
+            .map_err(|e| std::io::Error::other(format!("csprng: {e}")))?;
         write_new_0600(&self.path_for(job_id), &nonce)?;
         Ok(nonce)
     }
 
+    /// Where a job's committed [`CommitmentArtifacts`] live (PBA-L6b-007).
+    pub fn artifacts_path(&self, job_id: u128) -> PathBuf {
+        self.dir.join(format!("artifacts-{job_id}.bin"))
+    }
+
+    /// PBA-L6b-007 (NA-01 residual): durably persist the job's commitment
+    /// artifacts (`proofData = commitment ‖ nonce ‖ output`) `0600` BEFORE the
+    /// commitment is emitted. The nonce alone is not enough: after a restart the
+    /// executor would otherwise re-run (sampled, non-reproducible) inference and
+    /// reveal an output that cannot match the on-chain commitment — a slash.
+    ///
+    /// Atomic: written to a `0600` temp file, `fsync`ed, then renamed over the
+    /// final path, so a crash mid-write never leaves a torn artifacts file.
+    pub fn save_artifacts(&self, job_id: u128, art: &CommitmentArtifacts) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        harden_dir_perms(&self.dir)?;
+        let final_path = self.artifacts_path(job_id);
+        let tmp = self.dir.join(format!("artifacts-{job_id}.bin.tmp"));
+        // A stale temp file from an earlier crash is never trusted; replace it.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        write_new_0600(&tmp, &art.proof)?;
+        std::fs::rename(&tmp, &final_path)?;
+        sync_dir(&self.dir)
+    }
+
+    /// Reload a job's persisted artifacts, or `None` if none were saved. The
+    /// file is re-verified on load: `commitment == keccak256(output ‖ nonce)`
+    /// must hold, and the nonce must equal the job's persisted nonce, else the
+    /// file is corrupt and an error is surfaced (never silently re-derived).
+    pub fn load_artifacts(&self, job_id: u128) -> std::io::Result<Option<CommitmentArtifacts>> {
+        use std::io::Read;
+        let path = self.artifacts_path(job_id);
+        let f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut proof = Vec::new();
+        f.take(MAX_ARTIFACTS_BYTES + 1).read_to_end(&mut proof)?;
+        let corrupt = |why: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("persisted artifacts for job {job_id} are corrupt: {why}"),
+            )
+        };
+        if proof.len() as u64 > MAX_ARTIFACTS_BYTES {
+            return Err(corrupt("oversized"));
+        }
+        if proof.len() < 64 {
+            return Err(corrupt("shorter than commitment ‖ nonce"));
+        }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&proof[32..64]);
+        let rebuilt = CommitmentProver.build(&proof[64..], nonce);
+        if rebuilt.proof != proof {
+            return Err(corrupt("commitment does not match keccak256(output ‖ nonce)"));
+        }
+        match self.load(job_id)? {
+            Some(n) if n == nonce => Ok(Some(rebuilt)),
+            _ => Err(corrupt("nonce does not match the persisted commitment nonce")),
+        }
+    }
+}
+
+/// Upper bound on a persisted artifacts file (a model completion plus 64 bytes).
+const MAX_ARTIFACTS_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -104,7 +186,8 @@ fn write_new_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -114,7 +197,8 @@ fn write_new_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 #[cfg(unix)]

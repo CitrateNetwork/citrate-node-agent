@@ -20,4 +20,6 @@ pub use models::{
     WeightSource,
 };
 pub use proof::{CommitmentProver, ProofMaker};
-pub use runtime::{Inference, InferenceError, InferenceOutput, LlamaServerInference};
+pub use runtime::{
+    Inference, InferenceError, InferenceOutput, LlamaServerInference, LLAMA_FIXED_SEED,
+};

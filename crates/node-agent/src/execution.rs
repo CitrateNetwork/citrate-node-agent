@@ -88,6 +88,11 @@ pub const DEFAULT_MAX_JOB_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 /// The configured per-job input ceiling (env `CITRATE_MAX_JOB_INPUT_BYTES`,
 /// else [`DEFAULT_MAX_JOB_INPUT_BYTES`]). A value that a bid could not have
 /// accounted for is refused rather than run into a slash.
+/// Test-only: serializes every test that mutates `CITRATE_MAX_JOB_INPUT_BYTES`
+/// (process-global env), so parallel tests never observe each other's cap.
+#[cfg(test)]
+pub(crate) static INPUT_CAP_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub fn max_job_input_bytes() -> u64 {
     std::env::var("CITRATE_MAX_JOB_INPUT_BYTES")
         .ok()
@@ -435,6 +440,44 @@ where
             None => self.nonce,
         };
 
+        // PBA-L6b-007 (NA-01 residual): the nonce alone does not survive a
+        // restart safely — the committed OUTPUT must too. Reload the persisted
+        // artifacts; if the job is committed on-chain (and still awaiting the
+        // reveal) but they are gone, re-running (sampled) inference would reveal
+        // an output that cannot match the commitment. Abort instead.
+        if progress.artifacts.is_none() {
+            if let Some(store) = &self.nonce_store {
+                match store.load_artifacts(self.job_id) {
+                    Ok(Some(art)) => {
+                        progress.nonce = Some(nonce_seed);
+                        progress.artifacts = Some(art);
+                    }
+                    Ok(None)
+                        if resolved.committed && resolved.job.state == JobState::Executing =>
+                    {
+                        return record_error(
+                            state,
+                            format!(
+                                "job {}: committed on-chain but the committed output was not \
+                                 persisted; refusing to re-run inference and reveal a mismatched \
+                                 output (NA-01 / PBA-L6b-007)",
+                                self.job_id
+                            ),
+                        )
+                        .await
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return record_error(
+                            state,
+                            format!("job {}: loading commitment artifacts: {e}", self.job_id),
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+
         // The RunInference step needs the off-chain input; nothing else does. If
         // we're about to run inference and the input hasn't arrived, hold.
         let need_input = resolved.job.state == JobState::Executing && progress.artifacts.is_none();
@@ -464,7 +507,7 @@ where
             cache_dir: self.cache_dir.clone(),
         };
 
-        drive_job(
+        let outcome = drive_job(
             &ctx,
             &mut progress,
             state,
@@ -474,7 +517,24 @@ where
             nonce_seed,
             Some(&self.profiler),
         )
-        .await
+        .await;
+
+        // PBA-L6b-007: persist the fresh artifacts BEFORE the next step can emit
+        // `submitCommitment`. If the write fails, drop them from memory so the
+        // commitment is never emitted for an output a restart could not reveal.
+        if outcome == StepOutcome::RanInference {
+            if let (Some(store), Some(art)) = (&self.nonce_store, progress.artifacts.as_ref()) {
+                if let Err(e) = store.save_artifacts(self.job_id, art) {
+                    progress.artifacts = None;
+                    return record_error(
+                        state,
+                        format!("job {}: persisting commitment artifacts: {e}", self.job_id),
+                    )
+                    .await;
+                }
+            }
+        }
+        outcome
     }
 }
 
@@ -730,6 +790,7 @@ mod tests {
     // than running it and blowing the execution deadline (the on-chain slash).
     #[tokio::test]
     async fn oversized_input_is_refused_before_running_inference() {
+        let _env = INPUT_CAP_ENV_LOCK.lock().await;
         std::env::set_var("CITRATE_MAX_JOB_INPUT_BYTES", "1024");
         let state = shared();
         let signer = UnsignedJobSigner::new();
@@ -1083,5 +1144,140 @@ mod tests {
         assert!(validate_cid(&"x".repeat(50)).is_err());
         // Over the length ceiling.
         assert!(validate_cid(&format!("b{}", "a".repeat(300))).is_err());
+    }
+
+    // ── PBA-L6b-007 (NA-01 residual): committed output must survive a restart ──
+
+    /// Sampled engine: every run yields a different output (llama-server with a
+    /// non-zero temperature / random seed). Counts runs so a test can assert
+    /// that inference was NOT re-run after a restart.
+    struct NonDet(std::sync::atomic::AtomicU64);
+    impl Inference for NonDet {
+        async fn run(
+            &self,
+            _m: &ProvisionedModel,
+            input: &[u8],
+        ) -> Result<InferenceOutput, InferenceError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut bytes = format!("sample-{n}:").into_bytes();
+            bytes.extend_from_slice(input);
+            Ok(InferenceOutput { bytes })
+        }
+    }
+
+    fn l6b_state_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "citrate-l6b007-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn l6b_exec(
+        dir: &std::path::Path,
+        committed: bool,
+        seed: u64,
+    ) -> JobExecutor<FakeView, HasInput, Weights, NonDet, UnsignedJobSigner> {
+        JobExecutor {
+            job_id: 7,
+            me: ME,
+            marketplace: MARKETPLACE,
+            chain_id: 40204,
+            cache_dir: dir.join(format!("cache-{seed}")),
+            nonce: [0x42; 32],
+            nonce_store: Some(crate::nonce::NonceStore::new(dir.join("nonces"))),
+            view: FakeView(resolved_committed(JobState::Executing, ME, committed)),
+            input: HasInput,
+            weights: Weights,
+            inference: NonDet(std::sync::atomic::AtomicU64::new(seed)),
+            signer: UnsignedJobSigner::new(),
+            profiler: std::sync::Arc::new(ModelProfiler::new(6_000_000_000_000_000_000, 300)),
+            progress: tokio::sync::Mutex::new(JobProgress::default()),
+        }
+    }
+
+    // Inverted L6b PoC `l6b_na01_residual_restart_reveals_mismatched_output`:
+    // a restart between submitCommitment and submitResult must reveal the SAME
+    // output+nonce the chain committed to — reloaded from disk, never re-run.
+    #[tokio::test]
+    async fn l6b_007_restart_after_commit_reveals_the_committed_output() {
+        let state = shared();
+        let dir = l6b_state_dir("restart");
+        // process #1: infer, then emit submitCommitment (which lands on chain).
+        let p1 = l6b_exec(&dir, false, 0);
+        assert_eq!(p1.step(&state).await, StepOutcome::RanInference);
+        assert_eq!(
+            p1.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitCommitment)
+        );
+        let onchain = p1.progress.lock().await.artifacts.clone().unwrap();
+        drop(p1); // crash / update / reboot
+
+        // process #2: chain says committed=true.
+        let p2 = l6b_exec(&dir, true, 1000);
+        assert_eq!(
+            p2.step(&state).await,
+            StepOutcome::Signed(WriteIntent::SubmitResult),
+            "must reveal the persisted artifacts, not re-run inference"
+        );
+        assert_eq!(
+            p2.inference.0.load(std::sync::atomic::Ordering::SeqCst),
+            1000,
+            "inference must not run again after a restart"
+        );
+        let art2 = p2.progress.lock().await.artifacts.clone().unwrap();
+        let nonce: [u8; 32] = art2.proof[32..64].try_into().unwrap();
+        let recomputed = executor::CommitmentProver::commitment(&art2.proof[64..], &nonce);
+        assert_eq!(recomputed, onchain.commitment, "reveal reproduces the on-chain commitment");
+        assert_eq!(art2, onchain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Committed on-chain, nonce persisted, but the artifacts file is gone: the
+    // executor must abort (record an error) instead of re-running inference and
+    // revealing an output that cannot match the commitment.
+    #[tokio::test]
+    async fn l6b_007_committed_but_artifacts_missing_aborts_without_rerun() {
+        let state = shared();
+        let dir = l6b_state_dir("missing");
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        store.mint(7).unwrap(); // nonce survived, artifacts did not
+        let exec = l6b_exec(&dir, true, 0);
+        let outcome = exec.step(&state).await;
+        assert!(
+            matches!(outcome, StepOutcome::Error(ref m) if m.contains("NA-01")),
+            "must abort, got {outcome:?}"
+        );
+        assert_eq!(
+            exec.inference.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "inference must not be re-run"
+        );
+        assert!(exec.signer.recorded().is_empty(), "no write on abort");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The commitment is only emitted after the artifacts are durably on disk
+    // (0600), so no restart can observe a commitment without them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l6b_007_artifacts_are_persisted_0600_before_the_commitment() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = shared();
+        let dir = l6b_state_dir("perms");
+        let p1 = l6b_exec(&dir, false, 0);
+        assert_eq!(p1.step(&state).await, StepOutcome::RanInference);
+        let store = crate::nonce::NonceStore::new(dir.join("nonces"));
+        let on_disk = store.load_artifacts(7).unwrap().expect("artifacts persisted");
+        assert_eq!(Some(on_disk), p1.progress.lock().await.artifacts.clone());
+        let mode = std::fs::metadata(store.artifacts_path(7))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

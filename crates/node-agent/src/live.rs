@@ -234,6 +234,7 @@ mod tests {
     // cap refuses an oversized delivery instead of reading it.
     #[tokio::test]
     async fn file_input_source_rejects_oversized_input() {
+        let _env = crate::execution::INPUT_CAP_ENV_LOCK.lock().await;
         std::env::set_var("CITRATE_MAX_JOB_INPUT_BYTES", "1024");
         let dir = std::env::temp_dir().join("citrate-tripwire-na-b-003-input");
         let _ = std::fs::remove_dir_all(&dir);
