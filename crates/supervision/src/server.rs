@@ -1,7 +1,10 @@
 //! `server` — the local HTTP supervision surface the GUI drives.
 //!
 //! Endpoints (all localhost-only):
-//!   - `GET  /health`  → the [`Health`](crate::state::Health) JSON snapshot.
+//!   - `GET  /health`  → the [`Health`](crate::state::Health) JSON snapshot, with
+//!     `last_error` redacted to a fixed marker (it is unauthenticated — NA-02).
+//!   - `GET  /health/detail` → the same snapshot with the real `last_error`
+//!     (bearer-gated).
 //!   - `GET  /status`  → a bare JSON string: `"idle"|"bidding"|"executing"|"paused"`.
 //!   - `POST /pause`   → set paused (stop new bids, in-flight continue) → 200.
 //!   - `POST /resume`  → clear paused → 200.
@@ -98,6 +101,7 @@ async fn require_token(
 /// `/health` behind the per-instance bearer token in `auth`.
 pub fn router(state: SharedState, auth: SupervisionAuth) -> Router {
     let protected = Router::new()
+        .route("/health/detail", get(health_detail))
         .route("/status", get(status))
         .route("/pause", post(pause))
         .route("/resume", post(resume))
@@ -111,10 +115,26 @@ pub fn router(state: SharedState, auth: SupervisionAuth) -> Router {
         .with_state(state)
 }
 
-/// `GET /health` → the full health snapshot.
+/// Marker the open `/health` shows in place of the real error text.
+pub const REDACTED_LAST_ERROR: &str = "error recorded; details on authenticated GET /health/detail";
+
+/// `GET /health` → the health snapshot for unauthenticated liveness probes.
+///
+/// PBA-L6b-039 / NA-02: `last_error` carries raw error text (RPC URLs, local
+/// file paths, job ids). `/health` is deliberately open, so it only signals
+/// THAT an error was recorded; the text is on the token-gated
+/// `/health/detail`.
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
-    let snapshot = state.read().await.health();
+    let mut snapshot = state.read().await.health();
+    if snapshot.last_error.is_some() {
+        snapshot.last_error = Some(REDACTED_LAST_ERROR.to_string());
+    }
     Json(snapshot)
+}
+
+/// `GET /health/detail` (bearer-gated) → the full snapshot incl. `last_error`.
+async fn health_detail(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(state.read().await.health())
 }
 
 /// `GET /status` → a bare JSON status string.
@@ -483,6 +503,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 401);
+    }
+
+    // PBA-L6b-039 / NA-02: the unauthenticated /health must not leak the raw
+    // last_error text (RPC URLs, file paths, job ids); the full snapshot is on
+    // the token-gated /health/detail.
+    #[tokio::test]
+    async fn l6b_039_open_health_redacts_last_error_detail_is_gated() {
+        let state = shared();
+        state
+            .write()
+            .await
+            .set_last_error(Some("reading /home/op/secret-path/9.bin: boom".into()));
+        let addr = spawn(state.clone()).await;
+        let base = format!("http://{addr}");
+        let anon = reqwest::Client::new();
+
+        let body = anon
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !body.contains("secret-path"),
+            "NA-02: open /health leaked the error detail: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["last_error"].is_string(), "an error is still signalled: {body}");
+
+        let r = anon.get(format!("{base}/health/detail")).send().await.unwrap();
+        assert_eq!(r.status(), 401, "detail requires the bearer token");
+        let v: serde_json::Value = authed_client()
+            .get(format!("{base}/health/detail"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["last_error"], "reading /home/op/secret-path/9.bin: boom");
     }
 
     #[tokio::test]
