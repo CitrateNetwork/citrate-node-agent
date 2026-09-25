@@ -545,6 +545,53 @@ mod tests {
         assert!(placer.placed.lock().expect("mutex").is_empty(), "no bid on a closed job");
     }
 
+    // PBA-L6b-021 (R2 verifier): an open, profitable job whose on-chain
+    // inputHash is not a bindable 32-byte keccak (CID bytes via the SDK's
+    // documented path) reaches the tick through the same bridge gate the live
+    // view uses, and must produce NO bid — so the provider never wins a job its
+    // executor will refuse, and `timeoutJob` never slashes it.
+    #[tokio::test]
+    async fn l6b_021_unbindable_input_hash_places_no_bid() {
+        use chainio::marketplace::{Job as ChainJob, JobState, VerificationTier as ChainTier};
+        let mk = |input_hash| ChainJob {
+            id: 7,
+            requester: [0xaa; 20],
+            model_hash: [0u8; 32],
+            max_price_wei: 4 * bidder::ONE_SALT_WEI,
+            tier: ChainTier::Commitment,
+            state: JobState::Bidding,
+            assigned_provider: [0; 20],
+            escrow_wei: 4 * bidder::ONE_SALT_WEI,
+            bid_deadline_block: 100,
+            execution_deadline_block: 1000,
+            created_at_block: 50,
+            bid_count: 0,
+            input_hash,
+        };
+        for (hash, want) in [
+            (Some([0x11; 32]), TickOutcome::Bid),
+            (None, TickOutcome::NoBid),
+        ] {
+            let state = shared();
+            let mut snap = biddable_snapshot();
+            snap.bid_expires_block = crate::bridge::bid_expires_block(&mk(hash), 50);
+            let view = FakeView {
+                snapshot: snap,
+                fail: false,
+            };
+            let placer = RecordingPlacer {
+                placed: Mutex::new(Vec::new()),
+                expires: Mutex::new(Vec::new()),
+            };
+            assert_eq!(tick(&state, &view, &on_settings(), &placer).await, want);
+            assert_eq!(
+                placer.placed.lock().expect("mutex").is_empty(),
+                want == TickOutcome::NoBid,
+                "PBA-L6b-021: bid iff the inputHash is bindable (hash={hash:?})"
+            );
+        }
+    }
+
     // PBA-L6b-025: the queued bid expires at the job's bid deadline, not 0.
     #[tokio::test]
     async fn l6b_025_bid_carries_the_bid_deadline_as_expiry() {

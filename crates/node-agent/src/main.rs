@@ -212,6 +212,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (pflop_hours, exec_secs) = build_profiler().estimate(&job.model_hash);
     let bid_job = bridge::map_job(&job, current_block, secs_per_block, pflop_hours, exec_secs);
 
+    // PBA-L6b-021/025: the same open-for-bids gate the daemon applies (state,
+    // bid deadline, and a bindable 32-byte inputHash).
+    if bridge::bid_expires_block(&job, current_block).is_none() {
+        println!(
+            "DECISION: SKIP job #{} — not open for bids (state/deadline) or its inputHash cannot be bound to the input",
+            job.id
+        );
+        return Ok(());
+    }
+
     // 4. Decision.
     let decision = bidder::evaluate(&bid_job, &oracle, &bid_settings, &caps);
     match decision {

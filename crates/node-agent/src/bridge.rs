@@ -62,10 +62,20 @@ pub fn map_job(
 /// PBA-L6b-025: the block a bid on `job` must expire at, or `None` when the
 /// job is not open for bids (state other than Posted/Bidding, or the bid
 /// deadline has been reached at `current_block`).
+///
+/// PBA-L6b-021 (R2 verifier follow-up): also `None` when the job's on-chain
+/// `inputHash` is not a 32-byte keccak binding (`input_hash == None`, e.g. the
+/// CID bytes citrate-sdk-marketplace's `postJobCalldata` accepts). The executor
+/// refuses to run an input it cannot bind to the chain, so a job like that must
+/// be declined BEFORE bidding — refusing it after winning would leave the job
+/// to `timeoutJob`, which slashes the provider. Fail closed at bid time, never
+/// after assignment.
 pub fn bid_expires_block(job: &ChainJob, current_block: u128) -> Option<u128> {
     use chainio::marketplace::JobState;
     let open_state = matches!(job.state, JobState::Posted | JobState::Bidding);
-    (open_state && current_block < job.bid_deadline_block).then_some(job.bid_deadline_block)
+    let bindable_input = job.input_hash.is_some();
+    (open_state && bindable_input && current_block < job.bid_deadline_block)
+        .then_some(job.bid_deadline_block)
 }
 
 #[cfg(test)]
@@ -87,7 +97,7 @@ mod tests {
             execution_deadline_block: 1000,
             created_at_block: 50,
             bid_count: 1,
-            input_hash: None,
+            input_hash: Some([0x11; 32]),
         }
     }
 
@@ -155,5 +165,25 @@ mod tests {
             j.state = closed;
             assert_eq!(bid_expires_block(&j, 50), None, "{closed:?} is not open for bids");
         }
+    }
+
+    // PBA-L6b-021 (R2 verifier): a job whose inputHash cannot be bound to the
+    // delivered input (not a 32-byte keccak, e.g. CID bytes) is never bid on —
+    // the executor would refuse it after winning and the provider would be
+    // slashed by timeoutJob. A bindable job in the same window is still open.
+    #[test]
+    fn l6b_021_unbindable_input_hash_is_never_bid_on() {
+        let mut j = chain_job(); // Bidding, bid deadline 100, bindable hash
+        assert_eq!(
+            bid_expires_block(&j, 50),
+            Some(100),
+            "control: bindable job is open"
+        );
+        j.input_hash = None;
+        assert_eq!(
+            bid_expires_block(&j, 50),
+            None,
+            "PBA-L6b-021: no bid on an unbindable inputHash (no slash path)"
+        );
     }
 }
