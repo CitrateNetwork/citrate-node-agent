@@ -129,9 +129,13 @@ impl JobView for LiveJobView {
         // fail-safe defaults (the planner then waits / derives the tier).
         let job_id_ = job.id;
         let gates = lifecycle::ChainGates {
-            effective_tier: chainio::verifier::live::record_tier(&self.client, self.verifier, job_id_)
-                .await
-                .ok(),
+            effective_tier: chainio::verifier::live::record_tier(
+                &self.client,
+                self.verifier,
+                job_id_,
+            )
+            .await
+            .ok(),
             commitment_block: if committed {
                 chainio::verifier::live::commitment_block(&self.client, self.verifier, job_id_)
                     .await

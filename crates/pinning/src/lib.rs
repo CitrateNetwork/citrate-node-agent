@@ -150,7 +150,9 @@ impl core::fmt::Display for HoldReason {
                  governance backing (fund()) to seed one; sealing would revert \
                  \"{INSUFFICIENT_SLOT_FUNDING_REVERT}\" — backing off until governance funds it"
             ),
-            HoldReason::PinSlashed => write!(f, "pin is slashed; re-entry needs an operator decision"),
+            HoldReason::PinSlashed => {
+                write!(f, "pin is slashed; re-entry needs an operator decision")
+            }
             HoldReason::ChallengeWindowClosed => {
                 write!(f, "challenge response window closed; nothing to submit")
             }
@@ -591,23 +593,49 @@ mod tests {
         // A slot is only marked funded by the first sealCommit, which draws
         // QUORUM*REWARD from unallocatedSlotFunding. Enough backing → seal.
         for have in [SEED, SEED + 1] {
-            let a = plan_pin(&backed(input(none_pin(), slot(false, 0, 0), true, 100), have));
-            assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 }, "backing {have}");
+            let a = plan_pin(&backed(
+                input(none_pin(), slot(false, 0, 0), true, 100),
+                have,
+            ));
+            assert_eq!(
+                a,
+                PinAction::Seal {
+                    cid: CID,
+                    sector: 0
+                },
+                "backing {have}"
+            );
         }
     }
 
     #[test]
     fn fresh_slot_holds_while_backing_is_short() {
         for have in [0, SEED - 1] {
-            let a = plan_pin(&backed(input(none_pin(), slot(false, 0, 0), true, 100), have));
-            assert_eq!(a, PinAction::Hold(HoldReason::SlotUnfunded), "backing {have}");
+            let a = plan_pin(&backed(
+                input(none_pin(), slot(false, 0, 0), true, 100),
+                have,
+            ));
+            assert_eq!(
+                a,
+                PinAction::Hold(HoldReason::SlotUnfunded),
+                "backing {have}"
+            );
         }
     }
 
     #[test]
     fn funded_slot_does_not_need_backing() {
-        let a = plan_pin(&backed(input(none_pin(), slot(true, 9_000, 0), true, 100), 0));
-        assert_eq!(a, PinAction::Seal { cid: CID, sector: 0 });
+        let a = plan_pin(&backed(
+            input(none_pin(), slot(true, 9_000, 0), true, 100),
+            0,
+        ));
+        assert_eq!(
+            a,
+            PinAction::Seal {
+                cid: CID,
+                sector: 0
+            }
+        );
     }
 
     fn intent_of(a: PinAction) -> Option<PinIntent> {
@@ -639,7 +667,12 @@ mod tests {
             p
         };
         assert_eq!(
-            intent_of(plan_pin(&input(done(4_000, 10_000), slot(true, 9_000, 1), true, 100))),
+            intent_of(plan_pin(&input(
+                done(4_000, 10_000),
+                slot(true, 9_000, 1),
+                true,
+                100
+            ))),
             Some(PinIntent::ReturnBond)
         );
         // Bond already returned → nothing left to do.
@@ -683,13 +716,19 @@ mod tests {
         // Last round reached → no further challenge.
         p.round = 4;
         p.claimed = 4_000;
-        assert_eq!(plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100)), PinAction::Idle);
+        assert_eq!(
+            plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
         // Done (not Active) with rounds left and nothing owed → no challenge.
         p.status = PinStatus::Done;
         p.round = 2;
         p.claimed = 2_000;
         p.bond_held = 0;
-        assert_eq!(plan_pin(&input(p, slot(true, 9_000, 1), true, 100)), PinAction::Idle);
+        assert_eq!(
+            plan_pin(&input(p, slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
     }
 
     #[test]
@@ -702,7 +741,10 @@ mod tests {
 
     #[test]
     fn revert_reason_constant_matches_contract() {
-        assert_eq!(INSUFFICIENT_SLOT_FUNDING_REVERT, "Insufficient slot funding");
+        assert_eq!(
+            INSUFFICIENT_SLOT_FUNDING_REVERT,
+            "Insufficient slot funding"
+        );
         assert_eq!(
             PinSignerError::Reverted("x".into()).to_string(),
             "transaction reverted: x"

@@ -302,7 +302,10 @@ pub fn encode_register_provider(supported_models: &[Word]) -> Vec<u8> {
 
 /// `resultVerifiedAt(uint256 jobId)` calldata.
 pub fn encode_result_verified_at(job_id: u128) -> Vec<u8> {
-    abi::encode_call(selectors::result_verified_at(), &[abi::word_from_u128(job_id)])
+    abi::encode_call(
+        selectors::result_verified_at(),
+        &[abi::word_from_u128(job_id)],
+    )
 }
 
 /// `disputeResolvedForProvider(uint256 jobId)` calldata.

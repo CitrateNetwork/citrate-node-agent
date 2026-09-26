@@ -32,9 +32,7 @@ pub fn decode_commitment_submitted(data: &[u8]) -> Result<bool, AbiError> {
 /// Decode the verification `tier` (word 2) from a `getRecord` return: the
 /// tier the job is actually verified under (a Commitment request above
 /// `VALUE_THRESHOLD` reads ZKProof here).
-pub fn decode_record_tier(
-    data: &[u8],
-) -> Result<crate::marketplace::VerificationTier, AbiError> {
+pub fn decode_record_tier(data: &[u8]) -> Result<crate::marketplace::VerificationTier, AbiError> {
     let mut d = Decoder::new(data);
     d.word()?; // jobId
     d.word()?; // jobValue
@@ -136,7 +134,10 @@ mod tests {
     fn decodes_effective_tier_word_2() {
         use crate::marketplace::VerificationTier;
         let mut r = synth_record(true);
-        assert_eq!(decode_record_tier(&r).unwrap(), VerificationTier::Commitment);
+        assert_eq!(
+            decode_record_tier(&r).unwrap(),
+            VerificationTier::Commitment
+        );
         r[2 * 32 + 31] = 1;
         assert_eq!(decode_record_tier(&r).unwrap(), VerificationTier::ZKProof);
         r[2 * 32 + 31] = 3;

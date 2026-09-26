@@ -462,15 +462,26 @@ mod tests {
             0,
         )
         .await;
-        assert!(matches!(out, Err(TickError::Sign(PinSignerError::Reverted(_)))));
+        assert!(matches!(
+            out,
+            Err(TickError::Sign(PinSignerError::Reverted(_)))
+        ));
     }
 
     #[tokio::test]
     async fn fresh_slot_with_backing_seals_through_the_tick() {
         let signer = RecordingSigner::default();
-        let out = tick_pin(&fresh_slot_view(12_000), &FakeSealer, &signer, &HasReplica, &cfg(), CID, 0)
-            .await
-            .expect("tick");
+        let out = tick_pin(
+            &fresh_slot_view(12_000),
+            &FakeSealer,
+            &signer,
+            &HasReplica,
+            &cfg(),
+            CID,
+            0,
+        )
+        .await
+        .expect("tick");
         assert!(matches!(out, TickOutcome::Sealed(_)));
     }
 

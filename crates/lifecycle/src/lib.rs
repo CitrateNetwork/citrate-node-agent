@@ -579,7 +579,9 @@ mod tests {
         for head in [150, 200, 249] {
             assert_eq!(
                 plan(&with_gates(input(&j, head, true, None), verified_at(150))),
-                LifecycleAction::Wait(WaitReason::DisputeWindow { ready_at_block: 250 }),
+                LifecycleAction::Wait(WaitReason::DisputeWindow {
+                    ready_at_block: 250
+                }),
                 "head {head}"
             );
         }
@@ -610,7 +612,10 @@ mod tests {
     #[test]
     fn dispute_window_constant_matches_contract() {
         assert_eq!(DISPUTE_WINDOW_BLOCKS, 100);
-        assert_eq!(COMMITMENT_TIER_VALUE_THRESHOLD_WEI, 10_000_000_000_000_000_000);
+        assert_eq!(
+            COMMITMENT_TIER_VALUE_THRESHOLD_WEI,
+            10_000_000_000_000_000_000
+        );
     }
 
     #[test]

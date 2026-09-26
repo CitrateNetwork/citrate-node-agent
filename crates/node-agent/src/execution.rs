@@ -813,10 +813,22 @@ mod tests {
         //    nothing is emitted until block 250.
         c.job.state = JobState::Verifying;
         c.gates.result_verified_at = 150;
-        let o = drive_job(&c, &mut progress, &state, &Weights, &Echo, &signer, nonce, None).await;
+        let o = drive_job(
+            &c,
+            &mut progress,
+            &state,
+            &Weights,
+            &Echo,
+            &signer,
+            nonce,
+            None,
+        )
+        .await;
         assert_eq!(
             o,
-            StepOutcome::Waiting(WaitReason::DisputeWindow { ready_at_block: 250 })
+            StepOutcome::Waiting(WaitReason::DisputeWindow {
+                ready_at_block: 250
+            })
         );
         // 5b. Window elapsed → completeJob.
         c.current_block = 250;
