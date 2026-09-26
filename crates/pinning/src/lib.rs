@@ -127,7 +127,10 @@ pub enum HoldReason {
     /// Slot already has `liveCount == quorum` live pins and we hold none —
     /// no room to seal a fresh replica here.
     SlotAtQuorum,
-    /// Slot is unfunded (admin hasn't seeded its budget) — nothing to earn yet.
+    /// The slot has no budget yet and the contract's unallocated backing
+    /// (`unallocatedSlotFunding`, topped up by governance `fund()`) cannot seed
+    /// one, so `sealCommit` would revert "Insufficient slot funding". Back off
+    /// until governance funds the contract.
     SlotUnfunded,
     /// Pin is `Slashed`; re-entry needs an explicit `clearSlashed` decision
     /// (operator policy — not auto, to avoid burning bond in a loop).
@@ -135,6 +138,26 @@ pub enum HoldReason {
     /// Challenge is open but the response window has already closed — the next
     /// permissionless `slash` will record the miss; nothing to submit.
     ChallengeWindowClosed,
+}
+
+impl core::fmt::Display for HoldReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HoldReason::SlotAtQuorum => write!(f, "slot is at its replication quorum"),
+            HoldReason::SlotUnfunded => write!(
+                f,
+                "slot has no reward budget and the incentives contract holds too little \
+                 governance backing (fund()) to seed one; sealing would revert \
+                 \"{INSUFFICIENT_SLOT_FUNDING_REVERT}\" — backing off until governance funds it"
+            ),
+            HoldReason::PinSlashed => {
+                write!(f, "pin is slashed; re-entry needs an operator decision")
+            }
+            HoldReason::ChallengeWindowClosed => {
+                write!(f, "challenge response window closed; nothing to submit")
+            }
+        }
+    }
 }
 
 /// Everything [`plan_pin`] needs to choose the next action for one (cid,sector).
@@ -164,7 +187,17 @@ pub struct PinPlanInput {
     pub bond_wei: u128,
     /// Chain id (40204).
     pub chain_id: u64,
+    /// `QUORUM * REWARD` — the budget the first `sealCommit` on an unfunded
+    /// slot draws from the contract's unallocated backing.
+    pub slot_seed_wei: u128,
+    /// `unallocatedSlotFunding()` — backing deposited by governance `fund()`
+    /// and not yet assigned to a slot.
+    pub unallocated_slot_funding: u128,
 }
+
+/// Revert reason `IPFSIncentivesV2.sealCommit` returns when the contract holds
+/// too little governance backing to seed a fresh slot's budget.
+pub const INSUFFICIENT_SLOT_FUNDING_REVERT: &str = "Insufficient slot funding";
 
 /// Pure planner: given the on-chain pin/slot state, decide the next action.
 ///
@@ -210,7 +243,10 @@ pub fn plan_pin(i: &PinPlanInput) -> PinAction {
                 0,
             );
         }
-        if !i.slot.funded {
+        // A slot's budget is created by the first `sealCommit`, which draws
+        // `QUORUM * REWARD` from governance backing (`fund()`); without that
+        // backing the seal reverts, so hold instead of bonding into a revert.
+        if !i.slot.funded && i.unallocated_slot_funding < i.slot_seed_wei {
             return PinAction::Hold(HoldReason::SlotUnfunded);
         }
         if i.slot.live_count >= i.quorum {
@@ -362,6 +398,9 @@ pub enum PinSignerError {
     NoSigner,
     /// The surface rejected the request (e.g. user declined).
     Declined(String),
+    /// The write was broadcast (or simulated) and reverted on chain; carries
+    /// the revert reason as reported by the relay.
+    Reverted(String),
 }
 
 impl core::fmt::Display for PinSignerError {
@@ -369,6 +408,7 @@ impl core::fmt::Display for PinSignerError {
         match self {
             PinSignerError::NoSigner => write!(f, "no signing surface attached"),
             PinSignerError::Declined(m) => write!(f, "signing declined: {m}"),
+            PinSignerError::Reverted(m) => write!(f, "transaction reverted: {m}"),
         }
     }
 }
@@ -508,7 +548,17 @@ mod tests {
             incentives: INC,
             bond_wei: 10_000,
             chain_id: 40204,
+            slot_seed_wei: SEED,
+            unallocated_slot_funding: 0,
         }
+    }
+
+    /// QUORUM(3) * REWARD(4_000).
+    const SEED: u128 = 12_000;
+
+    fn backed(mut i: PinPlanInput, unallocated: u128) -> PinPlanInput {
+        i.unallocated_slot_funding = unallocated;
+        i
     }
 
     #[test]
@@ -536,6 +586,169 @@ mod tests {
     fn unfunded_slot_holds() {
         let a = plan_pin(&input(none_pin(), slot(false, 0, 0), true, 100));
         assert_eq!(a, PinAction::Hold(HoldReason::SlotUnfunded));
+    }
+
+    #[test]
+    fn fresh_slot_seals_once_governance_backing_covers_the_seed() {
+        // A slot is only marked funded by the first sealCommit, which draws
+        // QUORUM*REWARD from unallocatedSlotFunding. Enough backing → seal.
+        for have in [SEED, SEED + 1] {
+            let a = plan_pin(&backed(
+                input(none_pin(), slot(false, 0, 0), true, 100),
+                have,
+            ));
+            assert_eq!(
+                a,
+                PinAction::Seal {
+                    cid: CID,
+                    sector: 0
+                },
+                "backing {have}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_slot_holds_while_backing_is_short() {
+        for have in [0, SEED - 1] {
+            let a = plan_pin(&backed(
+                input(none_pin(), slot(false, 0, 0), true, 100),
+                have,
+            ));
+            assert_eq!(
+                a,
+                PinAction::Hold(HoldReason::SlotUnfunded),
+                "backing {have}"
+            );
+        }
+    }
+
+    #[test]
+    fn funded_slot_does_not_need_backing() {
+        let a = plan_pin(&backed(
+            input(none_pin(), slot(true, 9_000, 0), true, 100),
+            0,
+        ));
+        assert_eq!(
+            a,
+            PinAction::Seal {
+                cid: CID,
+                sector: 0
+            }
+        );
+    }
+
+    fn intent_of(a: PinAction) -> Option<PinIntent> {
+        match a {
+            PinAction::Sign(r) => Some(r.intent),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn challenge_answered_exactly_at_the_deadline_block() {
+        let mut p = none_pin();
+        p.status = PinStatus::Active;
+        p.challenge_open = true;
+        p.challenge_deadline = 200;
+        let a = plan_pin(&input(p, slot(true, 9_000, 1), true, 200));
+        assert!(matches!(a, PinAction::Prove { deadline: 200, .. }), "{a:?}");
+    }
+
+    #[test]
+    fn bond_returned_only_when_done_fully_claimed_and_held() {
+        // rounds 4 × per_round 1_000 → fully vested at 4_000.
+        let done = |claimed: u128, bond: u128| {
+            let mut p = none_pin();
+            p.status = PinStatus::Done;
+            p.round = 4;
+            p.claimed = claimed;
+            p.bond_held = bond;
+            p
+        };
+        assert_eq!(
+            intent_of(plan_pin(&input(
+                done(4_000, 10_000),
+                slot(true, 9_000, 1),
+                true,
+                100
+            ))),
+            Some(PinIntent::ReturnBond)
+        );
+        // Bond already returned → nothing left to do.
+        assert_eq!(
+            plan_pin(&input(done(4_000, 0), slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+        // Still Active and fully vested with bond held → no bond return yet.
+        let mut active = done(4_000, 10_000);
+        active.status = PinStatus::Active;
+        assert_eq!(
+            plan_pin(&input(active, slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+    }
+
+    #[test]
+    fn done_pin_with_unclaimed_vesting_claims_first() {
+        let mut p = none_pin();
+        p.status = PinStatus::Done;
+        p.round = 4;
+        p.claimed = 3_000;
+        p.bond_held = 10_000;
+        assert_eq!(
+            intent_of(plan_pin(&input(p, slot(true, 9_000, 1), true, 100))),
+            Some(PinIntent::Claim)
+        );
+    }
+
+    #[test]
+    fn challenge_opened_only_while_active_and_not_fully_vested() {
+        let mut p = none_pin();
+        p.status = PinStatus::Active;
+        p.round = 3;
+        p.claimed = 3_000;
+        p.bond_held = 10_000;
+        assert_eq!(
+            intent_of(plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100))),
+            Some(PinIntent::Challenge)
+        );
+        // Last round reached → no further challenge.
+        p.round = 4;
+        p.claimed = 4_000;
+        assert_eq!(
+            plan_pin(&input(p.clone(), slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+        // Done (not Active) with rounds left and nothing owed → no challenge.
+        p.status = PinStatus::Done;
+        p.round = 2;
+        p.claimed = 2_000;
+        p.bond_held = 0;
+        assert_eq!(
+            plan_pin(&input(p, slot(true, 9_000, 1), true, 100)),
+            PinAction::Idle
+        );
+    }
+
+    #[test]
+    fn slot_unfunded_hold_message_names_the_governance_step() {
+        let m = HoldReason::SlotUnfunded.to_string();
+        assert!(m.contains("fund()"), "{m}");
+        assert!(m.contains(INSUFFICIENT_SLOT_FUNDING_REVERT), "{m}");
+        assert!(m.contains("backing off"), "{m}");
+    }
+
+    #[test]
+    fn revert_reason_constant_matches_contract() {
+        assert_eq!(
+            INSUFFICIENT_SLOT_FUNDING_REVERT,
+            "Insufficient slot funding"
+        );
+        assert_eq!(
+            PinSignerError::Reverted("x".into()).to_string(),
+            "transaction reverted: x"
+        );
     }
 
     #[test]

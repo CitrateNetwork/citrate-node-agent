@@ -27,6 +27,7 @@ fn cfg() -> PinConfig {
         rounds: 4,
         per_round: 1_000,
         bond_wei: 10_000,
+        reward_wei: 4_000,
         challenge_n: 4,
     }
 }

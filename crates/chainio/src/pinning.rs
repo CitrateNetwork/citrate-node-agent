@@ -82,6 +82,16 @@ pub fn encode_registered(who: Address) -> Vec<u8> {
     abi::encode_call(selectors::pin_registered(), &[abi::word_from_address(who)])
 }
 
+/// `unallocatedSlotFunding()` — governance backing not yet assigned to a slot.
+pub fn encode_unallocated_slot_funding() -> Vec<u8> {
+    abi::encode_call(selectors::pin_unallocated_slot_funding(), &[])
+}
+
+/// Decode the `unallocatedSlotFunding()` return.
+pub fn decode_unallocated_slot_funding(data: &[u8]) -> Result<u128, AbiError> {
+    Decoder::new(data).u128()
+}
+
 /// `getPin(address pinner, bytes32 cid, uint256 sector)`.
 pub fn encode_get_pin(pinner: Address, cid: [u8; 32], sector: u128) -> Vec<u8> {
     abi::encode_call(

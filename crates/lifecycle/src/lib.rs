@@ -30,8 +30,38 @@
 use chainio::abi::{Address, Word};
 use chainio::marketplace::{
     encode_complete_job, encode_start_execution, encode_submit_commitment, encode_submit_result,
-    Job, JobState,
+    Job, JobState, VerificationTier,
 };
+
+/// `ComputeMarketplace.DISPUTE_WINDOW`: blocks after a Valid verification
+/// (`resultVerifiedAt`) before `completeJob` is accepted.
+pub const DISPUTE_WINDOW_BLOCKS: u128 = 100;
+
+/// `ComputeVerifier.VALUE_THRESHOLD` (10 SALT, in wei). A Commitment-tier
+/// request whose `maxPrice` is strictly above this is settled as ZKProof.
+pub const COMMITMENT_TIER_VALUE_THRESHOLD_WEI: u128 = 10 * 10u128.pow(18);
+
+/// Chain reads that gate the settlement-phase writes, resolved by the daemon
+/// each tick alongside `getJob`.
+///
+/// `Default` is the fail-safe reading: effective tier unknown (derived from the
+/// job), no commitment block, no verification block — so the planner waits
+/// rather than emitting a write the contract would reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainGates {
+    /// `ComputeVerifier.getRecord(jobId).tier` — the tier the job is actually
+    /// verified under (a >10 SALT Commitment request reads ZKProof here).
+    /// `None` when the record could not be read; the planner then derives the
+    /// tier from the job's requested tier and `maxPrice`.
+    pub effective_tier: Option<VerificationTier>,
+    /// `ComputeVerifier.commitmentBlock(jobId)` — block the commitment landed in.
+    pub commitment_block: u128,
+    /// `ComputeMarketplace.resultVerifiedAt(jobId)` — block the result verified
+    /// Valid (0 = not yet).
+    pub result_verified_at: u128,
+    /// `ComputeMarketplace.disputeResolvedForProvider(jobId)`.
+    pub dispute_resolved_for_provider: bool,
+}
 
 /// A concrete chain write the agent wants performed, as an **unsigned** request.
 /// The daemon hands this to the signing relay / gui-native; the user signs on a
@@ -127,6 +157,8 @@ pub struct PlanInput<'a> {
     /// The executor's output for this job, once inference has run. `None` until
     /// then (the planner asks for [`LifecycleAction::RunInference`]).
     pub artifacts: Option<&'a CommitmentArtifacts>,
+    /// Chain reads that gate the reveal and completion writes.
+    pub gates: ChainGates,
 }
 
 /// What the daemon should do next for a job.
@@ -142,6 +174,20 @@ pub enum LifecycleAction {
     Done,
     /// The job cannot proceed; give up safely (and surface the reason).
     Abort(AbortReason),
+    /// The next write is known but the chain would reject it this block; hold
+    /// and re-plan next tick.
+    Wait(WaitReason),
+}
+
+/// Why [`plan`] is holding a write until a later block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// `completeJob` is accepted from `ready_at_block` (the dispute window).
+    DisputeWindow { ready_at_block: u128 },
+    /// The job reads `Verifying` but `resultVerifiedAt` is not visible yet.
+    AwaitingVerification,
+    /// The result reveal must land in a later block than the commitment.
+    RevealAfterCommitBlock { commit_block: u128 },
 }
 
 /// Why a job can't be driven further.
@@ -161,6 +207,10 @@ pub enum AbortReason {
     JobFailedOnChain,
     /// The job is under dispute; completion is blocked.
     JobDisputed,
+    /// The job is verified under a tier this agent cannot prove (ZKProof or
+    /// TEE, including a Commitment request auto-upgraded above 10 SALT). Only
+    /// the Commitment tier is supported.
+    UnsupportedTier,
 }
 
 /// Decide the next action for one won job.
@@ -170,6 +220,16 @@ pub enum AbortReason {
 /// unsigned write, a request to run inference, or a terminal/abort signal.
 pub fn plan(input: &PlanInput) -> LifecycleAction {
     let job = input.job;
+    // Only the Commitment tier is provable by this agent. A job verified under
+    // ZKProof / TEE (including a Commitment request auto-upgraded above
+    // 10 SALT) is refused before any write is emitted for it.
+    if matches!(
+        job.state,
+        JobState::Assigned | JobState::Executing | JobState::Verifying
+    ) && effective_tier(input) != VerificationTier::Commitment
+    {
+        return LifecycleAction::Abort(AbortReason::UnsupportedTier);
+    }
     match job.state {
         // The bidder owns these phases; the lifecycle driver stays out.
         JobState::Posted | JobState::Bidding => LifecycleAction::Idle,
@@ -201,6 +261,12 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.current_block > job.execution_deadline_block {
                 return LifecycleAction::Abort(AbortReason::ExecutionDeadlinePassed);
             }
+            // The reveal must land in a later block than the commitment; with
+            // the head still at the commitment block, wait one block.
+            let commit_block = input.gates.commitment_block;
+            if commit_block != 0 && input.current_block <= commit_block {
+                return LifecycleAction::Wait(WaitReason::RevealAfterCommitBlock { commit_block });
+            }
             sign(
                 WriteIntent::SubmitResult,
                 encode_submit_result(job.id, &art.output_hash, &art.proof),
@@ -214,6 +280,19 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
             if input.me != job.assigned_provider {
                 return LifecycleAction::Abort(AbortReason::NotAssignedProvider);
             }
+            // `completeJob` is accepted only once the dispute window after the
+            // Valid verification has elapsed (or a dispute was resolved for
+            // the provider). Emitting it earlier is a guaranteed revert.
+            if !input.gates.dispute_resolved_for_provider {
+                let verified_at = input.gates.result_verified_at;
+                if verified_at == 0 {
+                    return LifecycleAction::Wait(WaitReason::AwaitingVerification);
+                }
+                let ready_at_block = verified_at.saturating_add(DISPUTE_WINDOW_BLOCKS);
+                if input.current_block < ready_at_block {
+                    return LifecycleAction::Wait(WaitReason::DisputeWindow { ready_at_block });
+                }
+            }
             sign(WriteIntent::CompleteJob, encode_complete_job(job.id), input)
         }
 
@@ -223,6 +302,22 @@ pub fn plan(input: &PlanInput) -> LifecycleAction {
         JobState::Failed => LifecycleAction::Abort(AbortReason::JobFailedOnChain),
         JobState::Disputed => LifecycleAction::Abort(AbortReason::JobDisputed),
     }
+}
+
+/// The tier the job is settled under: the verifier's record when read, else
+/// derived from the requested tier and `maxPrice` exactly as
+/// `ComputeVerifier.configureJob` does (Commitment above 10 SALT → ZKProof).
+pub fn effective_tier(input: &PlanInput) -> VerificationTier {
+    if let Some(t) = input.gates.effective_tier {
+        return t;
+    }
+    let job = input.job;
+    if job.tier == VerificationTier::Commitment
+        && job.max_price_wei > COMMITMENT_TIER_VALUE_THRESHOLD_WEI
+    {
+        return VerificationTier::ZKProof;
+    }
+    job.tier
 }
 
 /// Wrap a built calldata into an unsigned [`SignatureRequest`] for `intent`.
@@ -361,6 +456,23 @@ mod tests {
             chain_id: CHAIN_ID,
             committed,
             artifacts: art,
+            gates: ChainGates {
+                effective_tier: Some(VerificationTier::Commitment),
+                ..ChainGates::default()
+            },
+        }
+    }
+
+    fn with_gates<'a>(mut i: PlanInput<'a>, gates: ChainGates) -> PlanInput<'a> {
+        i.gates = gates;
+        i
+    }
+
+    fn verified_at(block: u128) -> ChainGates {
+        ChainGates {
+            effective_tier: Some(VerificationTier::Commitment),
+            result_verified_at: block,
+            ..ChainGates::default()
         }
     }
 
@@ -450,11 +562,117 @@ mod tests {
     }
 
     #[test]
-    fn verifying_emits_complete_job() {
+    fn verifying_emits_complete_job_once_dispute_window_elapsed() {
         let j = job(7, JobState::Verifying, ME, 200);
-        let req = expect_sign(plan(&input(&j, 220, true, None)), WriteIntent::CompleteJob);
+        // verified at 150 → completeJob accepted from block 250.
+        let req = expect_sign(
+            plan(&with_gates(input(&j, 250, true, None), verified_at(150))),
+            WriteIntent::CompleteJob,
+        );
         assert_eq!(req.calldata, encode_complete_job(7));
         assert_eq!(req.expires_block, 0); // no deadline on completion
+    }
+
+    #[test]
+    fn verifying_inside_dispute_window_waits() {
+        let j = job(7, JobState::Verifying, ME, 200);
+        for head in [150, 200, 249] {
+            assert_eq!(
+                plan(&with_gates(input(&j, head, true, None), verified_at(150))),
+                LifecycleAction::Wait(WaitReason::DisputeWindow {
+                    ready_at_block: 250
+                }),
+                "head {head}"
+            );
+        }
+    }
+
+    #[test]
+    fn verifying_without_verification_block_waits() {
+        let j = job(7, JobState::Verifying, ME, 200);
+        assert_eq!(
+            plan(&with_gates(input(&j, 10_000, true, None), verified_at(0))),
+            LifecycleAction::Wait(WaitReason::AwaitingVerification)
+        );
+    }
+
+    #[test]
+    fn verifying_resolved_for_provider_completes_without_window() {
+        let j = job(7, JobState::Verifying, ME, 200);
+        let g = ChainGates {
+            dispute_resolved_for_provider: true,
+            ..verified_at(0)
+        };
+        expect_sign(
+            plan(&with_gates(input(&j, 201, true, None), g)),
+            WriteIntent::CompleteJob,
+        );
+    }
+
+    #[test]
+    fn dispute_window_constant_matches_contract() {
+        assert_eq!(DISPUTE_WINDOW_BLOCKS, 100);
+        assert_eq!(
+            COMMITMENT_TIER_VALUE_THRESHOLD_WEI,
+            10_000_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn reveal_waits_while_head_is_the_commit_block() {
+        let j = job(7, JobState::Executing, ME, 200);
+        let art = artifacts();
+        let g = ChainGates {
+            effective_tier: Some(VerificationTier::Commitment),
+            commitment_block: 180,
+            ..ChainGates::default()
+        };
+        assert_eq!(
+            plan(&with_gates(input(&j, 180, true, Some(&art)), g)),
+            LifecycleAction::Wait(WaitReason::RevealAfterCommitBlock { commit_block: 180 })
+        );
+        expect_sign(
+            plan(&with_gates(input(&j, 181, true, Some(&art)), g)),
+            WriteIntent::SubmitResult,
+        );
+    }
+
+    #[test]
+    fn non_commitment_effective_tier_aborts_before_any_write() {
+        for tier in [VerificationTier::ZKProof, VerificationTier::Tee] {
+            let g = ChainGates {
+                effective_tier: Some(tier),
+                ..ChainGates::default()
+            };
+            for st in [JobState::Assigned, JobState::Executing] {
+                let j = job(7, st, ME, 200);
+                let art = artifacts();
+                assert_eq!(
+                    plan(&with_gates(input(&j, 120, true, Some(&art)), g)),
+                    LifecycleAction::Abort(AbortReason::UnsupportedTier),
+                    "{tier:?} {st:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_upgraded_job_aborts_when_record_unread() {
+        // Commitment requested, maxPrice 10 SALT + 1 wei → the verifier
+        // settles it as ZKProof. With no record read, derive it from the job.
+        let mut j = job(7, JobState::Assigned, ME, 200);
+        j.max_price_wei = COMMITMENT_TIER_VALUE_THRESHOLD_WEI + 1;
+        let g = ChainGates::default();
+        assert_eq!(
+            plan(&with_gates(input(&j, 120, false, None), g)),
+            LifecycleAction::Abort(AbortReason::UnsupportedTier)
+        );
+        // Exactly 10 SALT stays Commitment (the contract upgrades strictly above).
+        j.max_price_wei = COMMITMENT_TIER_VALUE_THRESHOLD_WEI;
+        expect_sign(
+            plan(&with_gates(input(&j, 120, false, None), g)),
+            WriteIntent::StartExecution,
+        );
     }
 
     #[test]
