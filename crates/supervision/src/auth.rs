@@ -436,4 +436,24 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A token file owned by another uid is refused, not adopted. Uses a
+    /// system file that exists on every Linux host and is owned by root; it is
+    /// only stat'ed and (if the guard were missing) read, never written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_existing_token_refuses_a_file_owned_by_another_uid() {
+        use std::os::unix::fs::MetadataExt;
+        let foreign = Path::new("/etc/passwd");
+        let euid = unsafe { libc::geteuid() };
+        let Ok(meta) = std::fs::symlink_metadata(foreign) else {
+            return; // no such file on this host: nothing to assert
+        };
+        if meta.uid() == euid || meta.file_type().is_symlink() {
+            return; // running as the file's owner (e.g. root): not a foreign inode
+        }
+        let err = read_existing_token(foreign).expect_err("a foreign-owned inode must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+        assert!(err.to_string().contains("owned by uid"), "{err}");
+    }
 }

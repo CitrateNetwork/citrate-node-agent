@@ -1105,6 +1105,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A nonce persisted for this job by an earlier run (restart before the
+    // commitment landed) is the one the re-run commits to, not the static
+    // fallback nonce or a freshly minted one.
+    #[tokio::test]
+    async fn executor_reuses_the_persisted_nonce_after_a_restart() {
+        let state = shared();
+        let mut exec = executor(resolved(JobState::Executing, ME), HasInput, "nonce-reuse");
+        let dir = std::env::temp_dir().join(format!(
+            "citrate-nonce-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = crate::nonce::NonceStore::new(dir.clone());
+        let persisted = store.mint(7).expect("mint");
+        assert_ne!(persisted, exec.nonce, "fixture: persisted nonce must differ from the fallback");
+        exec.nonce_store = Some(crate::nonce::NonceStore::new(dir.clone()));
+        assert_eq!(exec.step(&state).await, StepOutcome::RanInference);
+        let p = exec.progress.lock().await;
+        assert_eq!(p.nonce, Some(persisted), "re-run must commit to the persisted nonce");
+        let art = p.artifacts.as_ref().expect("artifacts");
+        assert_eq!(art, &executor::CommitmentProver.build(b"out:the prompt", persisted));
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn executor_waits_at_commitment_until_chain_confirms() {
         let state = shared();
