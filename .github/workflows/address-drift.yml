@@ -5,12 +5,15 @@ name: address-drift
 # until the repo re-syncs — the control that was missing when the 2026-07-27 reroll
 # silently shipped dead addresses across the federation.
 #
-# Requires the org secret CITRATE_CHAIN_READ_TOKEN: a read-only token with access to
-# CitrateNetwork/citrate-chain (already used by citrate-core CI). Once
-# @citratelabs/chain-config is published, this can be simplified to
-# `npx @citratelabs/chain-config check <file>` with no cross-repo checkout.
+# citrate-chain is a public repository, so the job checks it out without a token and
+# always runs. It used to skip itself green when the CITRATE_CHAIN_READ_TOKEN secret was
+# absent, and that secret was never set, so the gate never checked anything (2026-11-11,
+# fed ops/r1007-ceremony/ADDRESS_PROPAGATION.md gap 2). The daily schedule turns it red
+# when the chain's book moves (a new genesis), even with no change in this repo.
 
 on:
+  schedule:
+    - cron: '23 6 * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -29,37 +32,26 @@ concurrency:
 jobs:
   drift:
     runs-on: ubuntu-latest
-    # Internal-only gate (checks the vendored 40204 address book against the canonical set in the
-    # PRIVATE citrate-chain). Skips on public/fork CI (no token) so public CI never checks out a
-    # private repo; runs authoritatively on internal pushes once CITRATE_CHAIN_READ_TOKEN is set.
-    env:
-      CHAIN_TOKEN: ${{ secrets.CITRATE_CHAIN_READ_TOKEN }}
     steps:
-      - name: Skipped on public/fork CI (no chain read token)
-        if: env.CHAIN_TOKEN == ''
-        run: echo "address-drift is an internal supply-chain gate; skipped without CITRATE_CHAIN_READ_TOKEN."
       - name: Checkout this repo
-        if: env.CHAIN_TOKEN != ''
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: consumer
+          persist-credentials: false
       - name: Checkout canonical citrate-chain (sparse)
-        if: env.CHAIN_TOKEN != ''
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: CitrateNetwork/citrate-chain
           ref: main
-          token: ${{ secrets.CITRATE_CHAIN_READ_TOKEN }}
+          persist-credentials: false
           path: citrate-chain
           sparse-checkout: |
             contracts/addresses
             packages/chain-config
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: env.CHAIN_TOKEN != ''
         with:
           node-version: '20'
       - name: Address drift check (blocking)
-        if: env.CHAIN_TOKEN != ''
         run: |
           node citrate-chain/packages/chain-config/bin/check.mjs \
             check "consumer/crates/chainio/src/generated/addresses.json" \
